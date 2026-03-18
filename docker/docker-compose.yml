@@ -1,0 +1,43 @@
+services:
+  spark:
+    image: apache/spark:4.0.0
+    container_name: spark
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../data:/data
+      - ../spark_jobs:/spark_jobs
+      - ../pipeline:/pipeline
+    command: tail -f /dev/null
+
+  airflow:
+    build: .
+    container_name: airflow
+    depends_on:
+      - spark
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      PYTHONPATH: "/opt/airflow"
+    volumes:
+      - ../dags:/opt/airflow/dags
+      - ../spark_jobs:/opt/airflow/spark_jobs
+      - ../pipeline:/opt/airflow/pipeline
+      - ../monitoring:/opt/airflow/monitoring
+      - ../data:/data
+    ports:
+      - "8081:8080"
+    command: airflow standalone
+
+  streamlit:
+    build: .
+    container_name: streamlit
+    environment:
+      PYTHONPATH: "/app"
+    volumes:
+      - ../dashboard:/app
+      - ../pipeline:/app/pipeline
+      - ../data:/data
+    ports:
+      - "8501:8501"
+    entrypoint: ["streamlit"]
+    command: ["run", "/app/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

@@ -1,0 +1,25 @@
+# Agentic Metadata
+.agent/
+.agents/
+.streamlit/
+skills/
+skills-lock.json
+
+# Spark & Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Airflow
+logs/
+airflow.db
+standalone_admin_password.txt
+
+# Data (Delta & Ingestion)
+data/delta/
+data/input/
+data/archive/
+
+# OS
+.DS_Store
+Thumbs.db
