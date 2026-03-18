@@ -15,6 +15,8 @@ def get_spark_session(app_name="MedallionPipeline"):
         .config("spark.sql.shuffle.partitions", "1") \
         .config("spark.databricks.delta.schema.autoMerge.enabled", "true") \
         .config("spark.driver.extraJavaOptions", JAVA_OPTS) \
+        .config("spark.executor.memory", "512m") \
+        .config("spark.driver.memory", "512m") \
         .getOrCreate()
 
 def read_delta(spark, path):
