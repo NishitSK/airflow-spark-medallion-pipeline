@@ -27,6 +27,7 @@ with st.sidebar:
     
     if uploaded_file is not None:
         save_path = os.path.join(INPUT_PATH, uploaded_file.name)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         with open(save_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
         st.success(f"Saved: {uploaded_file.name}")

@@ -1,6 +1,7 @@
 # Agentic Metadata
 .agent/
 .agents/
+.env
 .streamlit/
 skills/
 skills-lock.json

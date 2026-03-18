@@ -17,6 +17,8 @@ services:
       - spark
     environment:
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:${AIRFLOW_ADMIN_PASSWORD}"
       PYTHONPATH: "/opt/airflow"
     volumes:
       - ../dags:/opt/airflow/dags
