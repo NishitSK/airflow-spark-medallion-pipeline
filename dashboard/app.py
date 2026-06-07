@@ -400,11 +400,12 @@ if page == "Medallion Dashboard":
     
     # Medallion Tabs
     tabs = st.tabs([
-        ":layers: Bronze (Raw)", 
-        ":cleaning_services: Silver (Cleaned)", 
-        ":trending_up: Gold (Trends)"
+        ":material/layers: Bronze (Raw)", 
+        ":material/cleaning_services: Silver (Cleaned)", 
+        ":material/trending_up: Gold (Trends)"
     ])
     
+
     with tabs[0]:
         with st.container(border=True):
             st.subheader("Raw Ingestion Feed")
