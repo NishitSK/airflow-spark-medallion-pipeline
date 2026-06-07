@@ -151,6 +151,8 @@ def generate_sample_datasets():
     small_path = os.path.join(SAMPLES_PATH, "small_sample.csv")
     medium_path = os.path.join(SAMPLES_PATH, "medium_sample.csv")
     large_path = os.path.join(SAMPLES_PATH, "large_sample.csv")
+    small_json_path = os.path.join(SAMPLES_PATH, "small_sample.json")
+    medium_json_path = os.path.join(SAMPLES_PATH, "medium_sample.json")
     
     # Names lists to make mock data look realistic
     first_names = ["John", "Jane", "Alice", "Bob", "Charlie", "David", "Eva", "Frank", "Grace", "Henry"]
@@ -170,6 +172,18 @@ def generate_sample_datasets():
         df.to_csv(small_path, index=False)
         print("Generated small_sample.csv")
         
+    # Small JSON (100 rows, newline-delimited JSON)
+    if not os.path.exists(small_json_path):
+        ids = list(range(1101, 1201))
+        names = [f"{random.choice(first_names)} {random.choice(last_names)}" for _ in ids]
+        ages = [random.randint(18, 75) for _ in ids]
+        df = pd.DataFrame({"id": ids, "name": names, "age": ages})
+        # Inject DQ violation samples
+        df.loc[0, "id"] = None
+        df.loc[1, "age"] = -3
+        df.to_json(small_json_path, orient="records", lines=True)
+        print("Generated small_sample.json")
+        
     # Medium: 10,000 rows (semi-clean, test spark scale)
     if not os.path.exists(medium_path):
         ids = list(range(2001, 12001))
@@ -182,6 +196,18 @@ def generate_sample_datasets():
         df.to_csv(medium_path, index=False)
         print("Generated medium_sample.csv")
         
+    # Medium JSON (10,000 rows, newline-delimited JSON)
+    if not os.path.exists(medium_json_path):
+        ids = list(range(12001, 22001))
+        names = [f"User_{i}" for i in ids]
+        ages = [random.randint(10, 95) for _ in ids]
+        df = pd.DataFrame({"id": ids, "name": names, "age": ages})
+        # Inject DQ violation samples
+        df.loc[0, "id"] = None
+        df.loc[1, "age"] = -2
+        df.to_json(medium_json_path, orient="records", lines=True)
+        print("Generated medium_sample.json")
+        
     # Large: 100,000 rows (clean data to show PySpark/Delta performance)
     if not os.path.exists(large_path):
         ids = list(range(12001, 112001))
@@ -190,6 +216,7 @@ def generate_sample_datasets():
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
         df.to_csv(large_path, index=False)
         print("Generated large_sample.csv")
+
 
 def get_file_metadata(filepath):
     """

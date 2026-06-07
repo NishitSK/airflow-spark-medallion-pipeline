@@ -312,11 +312,18 @@ if page == "Medallion Dashboard":
 
         col_btn1, col_btn2, col_btn3 = st.columns(3)
         with col_btn1:
-            st.button("📈 Load Small Dataset (100 rows)", use_container_width=True, on_click=load_sample, args=("Small", "small_sample.csv"), help="Contains raw duplicates and negative ages to test DQ features.")
+            st.button("📈 Load Small CSV (100 rows)", use_container_width=True, on_click=load_sample, args=("Small CSV", "small_sample.csv"), help="Contains duplicates & negative ages to test DQ rules.")
         with col_btn2:
-            st.button("📊 Load Medium Dataset (10K rows)", use_container_width=True, on_click=load_sample, args=("Medium", "medium_sample.csv"), help="Tests intermediate PySpark aggregation performance.")
+            st.button("📊 Load Medium CSV (10K rows)", use_container_width=True, on_click=load_sample, args=("Medium CSV", "medium_sample.csv"), help="Tests intermediate PySpark aggregation performance.")
         with col_btn3:
-            st.button("⚡ Load Large Dataset (100K+ rows)", use_container_width=True, on_click=load_sample, args=("Large", "large_sample.csv"), help="Demonstrates high-volume Delta Lake processing scales.")
+            st.button("⚡ Load Large CSV (100K+ rows)", use_container_width=True, on_click=load_sample, args=("Large CSV", "large_sample.csv"), help="Demonstrates high-volume Delta Lake processing scales.")
+            
+        col_json1, col_json2, _ = st.columns(3)
+        with col_json1:
+            st.button("📋 Load Small JSON (100 rows)", use_container_width=True, on_click=load_sample, args=("Small JSON", "small_sample.json"), help="Newline-delimited JSON format testing DQ features.")
+        with col_json2:
+            st.button("📂 Load Medium JSON (10K rows)", use_container_width=True, on_click=load_sample, args=("Medium JSON", "medium_sample.json"), help="Newline-delimited JSON format testing Spark aggregations.")
+
             
     # 2. Dataset Information & System Health (2 columns)
     col_info, col_health = st.columns(2)

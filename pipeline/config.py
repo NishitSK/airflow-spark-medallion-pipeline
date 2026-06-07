@@ -2,9 +2,10 @@ import os
 
 # Base paths
 # Detect if we are in the container (/data exists) or local (use relative path)
-if os.path.exists("/data"):
+if os.path.exists("/data") and os.name != "nt":
     BASE_DATA_PATH = "/data"
 else:
+
     # Fallback for local development outside Docker
     BASE_DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
