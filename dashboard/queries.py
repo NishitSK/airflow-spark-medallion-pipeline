@@ -166,11 +166,14 @@ def generate_sample_datasets():
         names = [f"{random.choice(first_names)} {random.choice(last_names)}" for _ in ids]
         ages = [random.randint(18, 75) for _ in ids]
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
+        # Use nullable integer to prevent cast to float due to None
+        df["id"] = df["id"].astype("Int64")
+        df["age"] = df["age"].astype("Int64")
         # Inject DQ violation samples
-        df.loc[0, "id"] = None       # Null ID
+        df.loc[0, "id"] = pd.NA        # Null ID
         df.loc[1, "age"] = -5        # Negative Age
         df.loc[2, "age"] = 150       # Out-of-bounds Age
-        df.loc[3, "id"] = 1005       # Duplicate ID (ID 1005 already exists elsewhere)
+        df.loc[3, "id"] = 1005       # Duplicate ID
         df.to_csv(small_path, index=False)
         print("Generated small_sample.csv")
         
@@ -180,8 +183,10 @@ def generate_sample_datasets():
         names = [f"{random.choice(first_names)} {random.choice(last_names)}" for _ in ids]
         ages = [random.randint(18, 75) for _ in ids]
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
+        df["id"] = df["id"].astype("Int64")
+        df["age"] = df["age"].astype("Int64")
         # Inject DQ violation samples
-        df.loc[0, "id"] = None
+        df.loc[0, "id"] = pd.NA
         df.loc[1, "age"] = -3
         df.to_json(small_json_path, orient="records", lines=True)
         print("Generated small_sample.json")
@@ -192,8 +197,10 @@ def generate_sample_datasets():
         names = [f"User_{i}" for i in ids]
         ages = [random.randint(10, 95) for _ in ids]
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
+        df["id"] = df["id"].astype("Int64")
+        df["age"] = df["age"].astype("Int64")
         # Inject mild DQ issues
-        df.loc[0, "id"] = None
+        df.loc[0, "id"] = pd.NA
         df.loc[1, "age"] = -1
         df.to_csv(medium_path, index=False)
         print("Generated medium_sample.csv")
@@ -204,8 +211,10 @@ def generate_sample_datasets():
         names = [f"User_{i}" for i in ids]
         ages = [random.randint(10, 95) for _ in ids]
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
+        df["id"] = df["id"].astype("Int64")
+        df["age"] = df["age"].astype("Int64")
         # Inject DQ violation samples
-        df.loc[0, "id"] = None
+        df.loc[0, "id"] = pd.NA
         df.loc[1, "age"] = -2
         df.to_json(medium_json_path, orient="records", lines=True)
         print("Generated medium_sample.json")
@@ -216,6 +225,8 @@ def generate_sample_datasets():
         names = [f"User_{i}" for i in ids]
         ages = [random.randint(18, 70) for _ in ids]
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
+        df["id"] = df["id"].astype("Int64")
+        df["age"] = df["age"].astype("Int64")
         df.to_csv(large_path, index=False)
         print("Generated large_sample.csv")
 
