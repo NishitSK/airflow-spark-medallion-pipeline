@@ -3,3 +3,4 @@ delta-spark
 apache-airflow
 pandas
 pendulum
+requests

@@ -22,6 +22,10 @@ INCIDENTS_PATH = f"{DELTA_PATH}/incidents"
 DQ_METRICS_PATH = f"{DELTA_PATH}/dq_metrics"
 TRACE_PATH = f"{DELTA_PATH}/pipeline_trace"
 METRICS_FILE = f"{BASE_DATA_PATH}/output/pipeline_metrics.txt"
+STATUS_FILE = f"{BASE_DATA_PATH}/output/pipeline_status.json"
+SAMPLES_PATH = f"{BASE_DATA_PATH}/samples"
+
+
 
 # Spark Config
 DELTA_PACKAGE = "io.delta:delta-spark_2.13:4.1.0"
