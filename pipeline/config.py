@@ -25,6 +25,8 @@ TRACE_PATH = f"{DELTA_PATH}/pipeline_trace"
 METRICS_FILE = f"{BASE_DATA_PATH}/output/pipeline_metrics.txt"
 STATUS_FILE = f"{BASE_DATA_PATH}/output/pipeline_status.json"
 SAMPLES_PATH = f"{BASE_DATA_PATH}/samples"
+HISTORY_FILE = f"{BASE_DATA_PATH}/output/pipeline_history.jsonl"
+
 
 
 

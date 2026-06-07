@@ -2,7 +2,7 @@ import sys
 import time
 import os
 import json
-from pipeline.config import METRICS_FILE, INCIDENTS_PATH, STATUS_FILE, INPUT_PATH
+from pipeline.config import METRICS_FILE, INCIDENTS_PATH, STATUS_FILE, INPUT_PATH, HISTORY_FILE, SILVER_PATH
 from pipeline.delta_utils import get_spark_session
 from spark_jobs.bronze_ingest import ingest_bronze
 from spark_jobs.validate_data import validate_data
@@ -47,6 +47,41 @@ def write_status(status, run_id, file_name=None, error=None, duration=None, stag
     except Exception as e:
         print(f"Error writing status file: {str(e)}")
 
+def append_to_history(status, run_id, file_name=None, error=None, duration=None, rows=0):
+    # Detect file in input if not passed
+    if not file_name and os.path.exists(INPUT_PATH):
+        try:
+            files = [f for f in os.listdir(INPUT_PATH) if f.endswith(('.csv', '.json'))]
+            if files:
+                files.sort(key=lambda x: os.path.getmtime(os.path.join(INPUT_PATH, x)), reverse=True)
+                file_name = files[0]
+        except:
+            pass
+    if not file_name and os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE, "r") as f:
+                old_status = json.load(f)
+                file_name = old_status.get("file_name")
+        except:
+            pass
+            
+    try:
+        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+        record = {
+            "timestamp": time.time(),
+            "run_id": run_id,
+            "file_name": file_name or "Unknown",
+            "status": status,
+            "duration": f"{duration:.2f}" if duration is not None else "N/A",
+            "rows": rows,
+            "error": error
+        }
+        with open(HISTORY_FILE, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        print(f"Error writing history file: {str(e)}")
+
+
 def run_unified_pipeline():
     start_time = time.time()
     spark = get_spark_session("UnifiedMedallionPipeline")
@@ -69,6 +104,7 @@ def run_unified_pipeline():
             print(f"\nSTOP: {error_msg}")
             log_incident("unified_pipeline", run_id, "validation_step", error_msg, "CRITICAL")
             write_status("failed", run_id, error=error_msg, stage="Failed")
+            append_to_history("failed", run_id, file_name=None, error=error_msg, duration=time.time()-start_time, rows=0)
             return
         
         # 3. Silver Transformation
@@ -89,14 +125,25 @@ def run_unified_pipeline():
         with open(METRICS_FILE, "w") as f:
             f.write(f"{time.time()},{duration:.2f}\n")
             
+        rows_processed = 0
+        try:
+            if os.path.exists(SILVER_PATH):
+                rows_processed = spark.read.format("delta").load(SILVER_PATH).count()
+        except:
+            pass
+
         write_status("completed", run_id, duration=duration, stage="Finished")
+        append_to_history("completed", run_id, file_name=None, error=None, duration=duration, rows=rows_processed)
             
     except Exception as e:
         error_msg = str(e)
+        duration = time.time() - start_time
         print(f"\n--- Unified Pipeline Failed: {error_msg} ---")
         log_incident("unified_pipeline", run_id, "main_process", error_msg, "ERROR")
         write_status("failed", run_id, error=error_msg, stage="Failed")
+        append_to_history("failed", run_id, file_name=None, error=error_msg, duration=duration, rows=0)
         sys.exit(1)
+
     finally:
         spark.stop()
 

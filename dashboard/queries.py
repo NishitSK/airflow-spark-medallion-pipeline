@@ -1,10 +1,12 @@
 import os
 import json
+import time
 import streamlit as st
 import random
-from pipeline.config import BRONZE_PATH, SILVER_PATH, GOLD_PATH, TRACE_PATH, DQ_METRICS_PATH, METRICS_FILE, STATUS_FILE, INPUT_PATH, ARCHIVE_PATH, SAMPLES_PATH
+from pipeline.config import BRONZE_PATH, SILVER_PATH, GOLD_PATH, TRACE_PATH, DQ_METRICS_PATH, METRICS_FILE, STATUS_FILE, INPUT_PATH, ARCHIVE_PATH, SAMPLES_PATH, HISTORY_FILE
 from pipeline.delta_utils import get_spark_session
 from airflow_client import check_latest_dag_status
+
 
 @st.cache_resource
 def get_spark():
@@ -220,24 +222,105 @@ def generate_sample_datasets():
 
 def get_file_metadata(filepath):
     """
-    Returns (size_mb, row_count) for a dataset file.
+    Returns (size_mb, row_count, col_count) for a CSV or JSON file.
     """
     if not os.path.exists(filepath):
-        return 0.0, 0
+        return 0.0, 0, 0
     try:
         size_bytes = os.path.getsize(filepath)
         size_mb = size_bytes / (1024 * 1024)
         
         row_count = 0
+        col_count = 0
+        
+        # Count lines
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             for _ in f:
                 row_count += 1
-        
-        # Subtract 1 for CSV header
-        if filepath.endswith('.csv') and row_count > 0:
-            row_count -= 1
-        return size_mb, row_count
+                
+        # Parse preview to get column count
+        import pandas as pd
+        if filepath.endswith('.csv'):
+            if row_count > 0:
+                row_count -= 1
+            # Read header
+            try:
+                df = pd.read_csv(filepath, nrows=1)
+                col_count = len(df.columns)
+            except:
+                pass
+        elif filepath.endswith('.json'):
+            try:
+                df = pd.read_json(filepath, lines=True, nrows=1)
+                col_count = len(df.columns)
+            except:
+                pass
+                
+        return size_mb, row_count, col_count
     except:
-        return 0.0, 0
+        return 0.0, 0, 0
+
+def get_file_preview(filepath):
+    """
+    Safely reads first 10 rows of a CSV or JSON file and returns a Pandas DataFrame.
+    """
+    import pandas as pd
+    if not os.path.exists(filepath):
+        return None
+    try:
+        if filepath.endswith('.csv'):
+            return pd.read_csv(filepath, nrows=10)
+        elif filepath.endswith('.json'):
+            return pd.read_json(filepath, lines=True, nrows=10)
+    except:
+        pass
+    return None
+
+def get_pipeline_history(spark):
+    """
+    Retrieves the latest 20 pipeline run records.
+    Parses HISTORY_FILE (JSONL), falling back to Silver table Delta log history if empty.
+    """
+    import pandas as pd
+    runs = []
+    
+    # 1. Try reading from persistent HISTORY_FILE
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                for line in f:
+                    if line.strip():
+                        runs.append(json.loads(line))
+        except:
+            pass
+            
+    # 2. If no logs yet, fallback to querying Delta Lake log history
+    if not runs and spark is not None:
+        try:
+            from delta.tables import DeltaTable
+            if os.path.exists(SILVER_PATH):
+                dt_silver = DeltaTable.forPath(spark, SILVER_PATH)
+                history_df = dt_silver.history().select("timestamp", "version", "operation", "operationMetrics").toPandas()
+                history_df.sort_values("version", ascending=False, inplace=True)
+                
+                for idx, row in history_df.iterrows():
+                    metrics = row["operationMetrics"] if row["operationMetrics"] else {}
+                    rows = int(metrics.get('numOutputRows', 0)) if metrics.get('numOutputRows') else 0
+                    
+                    runs.append({
+                        "timestamp": row["timestamp"].timestamp() if pd.notnull(row["timestamp"]) else time.time(),
+                        "run_id": f"delta_v{row['version']}",
+                        "file_name": f"Delta Transaction (v{row['version']})",
+                        "status": "completed",
+                        "duration": "N/A",
+                        "rows": rows,
+                        "error": None
+                    })
+        except:
+            pass
+            
+    runs.sort(key=lambda x: x.get("timestamp", 0.0), reverse=True)
+    return runs[:20]
+
 
 
