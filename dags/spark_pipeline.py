@@ -27,7 +27,8 @@ with DAG(
         bash_command="""
         mkdir -p /data/archive
         mv /data/input/*.csv /data/archive/ 2>/dev/null || true
-        """
+        """,
+        trigger_rule="all_done",
     )
 
     run_spark >> archive_file

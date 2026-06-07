@@ -69,6 +69,7 @@ with DAG(
     archive_file = BashOperator(
         task_id="archive_file",
         bash_command="mkdir -p /data/archive && mv /data/input/*.csv /data/input/*.json /data/archive/ 2>/dev/null || true",
+        trigger_rule="all_done",
     )
 
     # Task order
