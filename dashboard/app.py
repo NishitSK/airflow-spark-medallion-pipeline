@@ -252,7 +252,12 @@ with st.container(border=True):
     with col_status:
         st.markdown(f'**Pipeline Status:**  \n<div class="status-badge {pulse_class}" style="{style}">{icon} {status}</div>', unsafe_allow_html=True)
         if status == "Pipeline failed" and error_msg:
-            st.caption(f"⚠️ `{error_msg}`")
+            # Sanitize error to prevent leaking developer info (e.g. stack traces, file paths)
+            user_friendly_error = error_msg
+            if "halted due to critical Data Quality issues" not in error_msg:
+                user_friendly_error = "An unexpected error occurred during pipeline execution. Please verify your dataset schema or check Spark logs."
+            st.caption(f"⚠️ `{user_friendly_error}`")
+
         else:
             st.caption(f"Sync: `{status_src}`")
     with col_file:
