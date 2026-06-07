@@ -195,15 +195,15 @@ def get_user_friendly_error(err):
     if not err:
         return "An unknown error occurred.", "Verify that the pipeline is deployed and folders are accessible."
     err_lower = str(err).lower()
-    if "dq" in err_lower or "validation" in err_lower or "quality" in err_lower or "negative" in err_lower or "null" in err_lower:
+    if "not found" in err_lower or "does not exist" in err_lower or "no such file" in err_lower or "missing" in err_lower:
+        return (
+            "A required storage path or Delta table directory is unavailable.",
+            "Verify that your local storage directories under data/ are mounted and writable. Ensure a dataset has been ingested first."
+        )
+    elif "halted due to critical data quality" in err_lower or "critical dq failure" in err_lower or "duplicate" in err_lower:
         return (
             "Halted due to critical Data Quality violations in raw data.",
             "Verify that your input file does not contain duplicate IDs, null keys, or negative ages. Run the 'Medium Sample' to test clean execution."
-        )
-    elif "not found" in err_lower or "no such file" in err_lower or "missing" in err_lower:
-        return (
-            "A required storage path or Delta table directory is unavailable.",
-            "Verify that your local storage directories under data/ are mounted and writable."
         )
     elif "connection" in err_lower or "refused" in err_lower or "unreachable" in err_lower:
         return (

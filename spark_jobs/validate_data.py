@@ -16,6 +16,11 @@ def validate_data(spark=None):
     spark.sparkContext.setLogLevel(SPARK_LOG_LEVEL)
 
     try:
+        import os
+        if not os.path.exists(BRONZE_PATH):
+            print("Validation: Bronze layer directory does not exist yet. No data to validate.")
+            return True
+            
         df = read_delta(spark, BRONZE_PATH)
         total_rows = df.count()
         

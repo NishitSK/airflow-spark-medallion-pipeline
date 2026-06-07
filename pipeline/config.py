@@ -1,4 +1,9 @@
 import os
+import sys
+
+# Ensure PySpark uses the correct Python executable across environments
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
 # Base paths
 # Detect if we are in the container (/data exists) or local (use relative path)
