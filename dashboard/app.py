@@ -14,7 +14,8 @@ from queries import (
     generate_sample_datasets, 
     get_file_metadata, 
     get_file_preview, 
-    get_pipeline_history
+    get_pipeline_history,
+    get_last_uploaded_file
 )
 from charts import (
     plot_age_distribution, 
@@ -31,7 +32,8 @@ from pipeline.config import (
     SAMPLES_PATH, 
     HISTORY_FILE, 
     DQ_METRICS_PATH, 
-    ARCHIVE_PATH
+    ARCHIVE_PATH,
+    STATUS_FILE
 )
 
 st.set_page_config(
