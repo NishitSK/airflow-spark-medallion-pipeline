@@ -2,16 +2,49 @@ import streamlit as st
 import pandas as pd
 import os
 import time
-from queries import get_spark, get_kpis, load_layer_data, convert_df_to_csv, get_consolidated_status, generate_sample_datasets, get_file_metadata
-from charts import plot_age_distribution, plot_gold_trends
-from pipeline.config import BRONZE_PATH, SILVER_PATH, GOLD_PATH, INPUT_PATH
+import shutil
+from datetime import datetime
 
-# Generate built-in samples on startup
+from queries import (
+    get_spark, 
+    get_kpis, 
+    load_layer_data, 
+    convert_df_to_csv, 
+    get_consolidated_status, 
+    generate_sample_datasets, 
+    get_file_metadata, 
+    get_file_preview, 
+    get_pipeline_history
+)
+from charts import (
+    plot_age_distribution, 
+    plot_gold_trends, 
+    plot_data_funnel, 
+    plot_pipeline_history, 
+    plot_dq_violations
+)
+from pipeline.config import (
+    BRONZE_PATH, 
+    SILVER_PATH, 
+    GOLD_PATH, 
+    INPUT_PATH, 
+    SAMPLES_PATH, 
+    HISTORY_FILE, 
+    DQ_METRICS_PATH, 
+    ARCHIVE_PATH
+)
+
+st.set_page_config(
+    page_title="Medallion Pipeline Dashboard",
+    page_icon="📊",
+    layout="wide"
+)
+
+# Initialize sample datasets on startup
 try:
     generate_sample_datasets()
-except Exception as e:
-    st.sidebar.error(f"Failed to generate samples: {e}")
-
+except:
+    pass
 
 # Initialize session state for Airflow settings
 if "use_airflow_api" not in st.session_state:
@@ -23,77 +56,22 @@ if "airflow_username" not in st.session_state:
 if "airflow_password" not in st.session_state:
     st.session_state.airflow_password = "admin"
 
-
-st.set_page_config(
-    page_title="Medallion Pipeline Dashboard",
-    page_icon=":material/analytics:",
-    layout="wide"
-)
-
 # Sidebar Design
 with st.sidebar:
-    st.title("Medallion Control")
+    st.title("🛡️ Pipeline Control")
+    st.caption("Lakehouse Orchestrator")
+    st.divider()
+    
     page = st.radio(
         "Navigation", 
-        ["Medallion Dashboard", "Processed Files History", "Data Engineering Infographics"],
-        index=0,
-        label_visibility="collapsed"
+        ["Pipeline Dashboard", "Delta Lake Transaction Log", "Pipeline Analytics"],
+        index=0
     )
     
     st.divider()
-    st.subheader("📤 Data Ingestion")
-    uploaded_file = st.file_uploader("Upload CSV or JSON", type=['csv', 'json'])
-    
-    if uploaded_file is not None:
-        save_path = os.path.join(INPUT_PATH, uploaded_file.name)
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.success(f"Saved: {uploaded_file.name}")
-        
-    if st.button("🚀 Run Pipeline Now", type="primary", use_container_width=True):
-        with st.status("Executing Pipeline..."):
-            st.write("Running Unified Medallion Process...")
-            # We run it inside the container using the path /opt/airflow/... 
-            # or use the local path if it's mapped correctly. 
-            # In the container, airflow is at /opt/airflow.
-            result = os.system("python /opt/airflow/spark_jobs/unified_pipeline.py")
-            if result == 0:
-                st.success("Pipeline Run Success!")
-                st.rerun()
-            else:
-                st.error("Pipeline Run Failed. Check incidents log.")
-    
-    st.divider()
-    st.subheader("📋 Download Test Examples")
-    st.write("Use these to test Data Quality (DQ) features:")
-    
-    # Example CSV (1000s Range)
-    example_csv = "id,name,age\n1001,Alice,25\n1002,Bob,-5\n,Charlie,30\n1004,David,150\n1005,Eve,22\n1001,Alice Duplicate,25"
-    st.download_button(
-        "Download Example CSV", 
-        example_csv, 
-        "test_csv_1000s.csv", 
-        "text/csv", 
-        use_container_width=True,
-        help="Contains: ID 1001 (Dupe), ID Null, IDs 1002 & 1004 (Age Issues)"
-    )
-    
-    # Example JSON (2000s Range)
-    example_json = '{"id": 2001, "name": "Json Alice", "age": 28}\n{"id": 2002, "name": "Json Bob", "age": -10}\n{"id": null, "name": "Json Null", "age": 45}\n{"id": 2001, "name": "Json Duplicate", "age": 28}'
-    st.download_button(
-        "Download Example JSON", 
-        example_json, 
-        "test_json_2000s.json", 
-        "application/json", 
-        use_container_width=True,
-        help="Contains: ID 2001 (Dupe), ID Null, ID 2002 (Neg Age)"
-    )
-
-    st.divider()
-    with st.expander("⚙️ Airflow Connection Settings"):
-        st.session_state.use_airflow_api = st.checkbox("Enable Airflow API Sync", value=st.session_state.use_airflow_api)
-        st.session_state.airflow_api_url = st.text_input("Airflow API URL", value=st.session_state.airflow_api_url)
+    with st.expander("⚙️ Connection Settings"):
+        st.session_state.use_airflow_api = st.checkbox("Enable Orchestrator Sync", value=st.session_state.use_airflow_api)
+        st.session_state.airflow_api_url = st.text_input("Scheduler API URL", value=st.session_state.airflow_api_url)
         st.session_state.airflow_username = st.text_input("API Username", value=st.session_state.airflow_username)
         st.session_state.airflow_password = st.text_input("API Password", value=st.session_state.airflow_password, type="password")
         
@@ -105,331 +83,346 @@ with st.sidebar:
                 st.session_state.airflow_password
             )
             if success:
-                st.success(msg)
+                st.success("Successfully connected to the pipeline scheduler REST API.")
             else:
-                st.error(msg)
+                st.error("Failed to connect to the pipeline scheduler. Verify connection settings and logs.")
 
     st.divider()
-    st.caption("v2.8 - Live Pipeline Status Integration")
+    st.caption("Production Build: v3.0")
 
-# Resolve Airflow credentials from session state
+# Fetch Connection Settings
 api_url = st.session_state.airflow_api_url if st.session_state.use_airflow_api else None
 username = st.session_state.airflow_username
 password = st.session_state.airflow_password
 
+# Retrieve status from consolidated pipeline states
 status, last_success, last_file, error_msg, status_src, stage, duration = get_consolidated_status(api_url, username, password)
 
-# Check for completion notification toast
+# Completion notify check
 if "last_status" not in st.session_state:
     st.session_state.last_status = status
 
 if st.session_state.last_status == "Pipeline running" and status == "Pipeline completed":
-    st.toast("🎉 Pipeline run succeeded! Fresh gold insights are now available.", icon="📈")
+    st.toast("🎉 Ingestion run successfully completed! Lakehouse tables updated.", icon="✅")
 st.session_state.last_status = status
 
-# Styles and Badge
-st.markdown(
-    """
-    <style>
-    @keyframes pulse {
-        0% { opacity: 0.6; }
-        50% { opacity: 1.0; }
-        100% { opacity: 0.6; }
-    }
-    .status-badge {
-        padding: 6px 12px;
-        border-radius: 6px;
-        font-weight: 600;
-        font-size: 13px;
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-    }
-    .pulse-animation {
-        animation: pulse 2.5s infinite;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+# Setup Spark
+spark = get_spark()
 
-status_styles = {
-    "Waiting for file": "background-color: rgba(71, 85, 105, 0.15); border: 1px solid rgba(71, 85, 105, 0.4); color: #94a3b8;",
-    "Pipeline running": "background-color: rgba(234, 179, 8, 0.15); border: 1px solid rgba(234, 179, 8, 0.5); color: #facc15;",
-    "Pipeline completed": "background-color: rgba(34, 197, 94, 0.15); border: 1px solid rgba(34, 197, 94, 0.5); color: #4ade80;",
-    "Pipeline failed": "background-color: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.5); color: #f87171;"
-}
-status_icons = {
-    "Waiting for file": "📥",
-    "Pipeline running": "⚙️",
-    "Pipeline completed": "✅",
-    "Pipeline failed": "❌"
-}
+# Retrieve latest metrics
+b_runtime, b_total = get_kpis(spark)
+history_records = get_pipeline_history(spark)
+latest_run_rows = history_records[0].get("rows", 0) if history_records else 0
 
-style = status_styles.get(status, status_styles["Waiting for file"])
-icon = status_icons.get(status, "❓")
-pulse_class = "pulse-animation" if status == "Pipeline running" else ""
+# Convert status to display state
+status_indicator = "🟢 Healthy"
+if status == "Pipeline running":
+    status_indicator = "🟡 Running"
+elif status == "Pipeline failed":
+    status_indicator = "🔴 Failed"
 
-def render_timeline_html(status, stage):
-    stages = ["Upload", "Bronze Ingestion", "Silver Transformation", "Gold Aggregation"]
-    states = [2, 0, 0, 0] # Upload is always completed
-    
-    if status == "Pipeline running":
-        if stage == "Bronze":
-            states[1] = 1
-        elif stage == "Validation":
-            states[1] = 2
-            states[2] = 1
-        elif stage == "Silver":
-            states[1] = 2
-            states[2] = 1
-        elif stage == "Gold":
-            states[1] = 2
-            states[2] = 2
-            states[3] = 1
-    elif status == "Pipeline completed":
-        states[1] = 2
-        states[2] = 2
-        states[3] = 2
-    elif status == "Pipeline failed":
-        if stage == "Bronze":
-            states[1] = 3
-        elif stage == "Validation":
-            states[1] = 2
-            states[2] = 3
-        elif stage == "Silver":
-            states[1] = 2
-            states[2] = 3
-        elif stage == "Gold":
-            states[1] = 2
-            states[2] = 2
-            states[3] = 3
-            
-    html = '<div style="display: flex; align-items: center; justify-content: space-between; margin: 15px 0; font-family: sans-serif; overflow-x: auto; padding: 12px 10px; background: rgba(15, 23, 42, 0.3); border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.05);">'
-    
-    colors = {
-        0: {"bg": "#1e293b", "border": "#334155", "text": "#64748b", "label": "Queued"},
-        1: {"bg": "rgba(234, 179, 8, 0.1)", "border": "#eab308", "text": "#facc15", "label": "Processing..."},
-        2: {"bg": "rgba(34, 197, 94, 0.1)", "border": "#22c55e", "text": "#4ade80", "label": "Completed"},
-        3: {"bg": "rgba(239, 68, 68, 0.1)", "border": "#ef4444", "text": "#f87171", "label": "Failed"}
-    }
-    
-    icons_list = {
-        0: "⏳",
-        1: "⚙️",
-        2: "✅",
-        3: "❌"
-    }
-    
-    for i, name in enumerate(stages):
-        state = states[i]
-        c = colors[state]
-        ic = icons_list[state]
-        pulse = "pulse-animation" if state == 1 else ""
-        
-        html += f'''
-        <div style="text-align: center; flex: 1; min-width: 120px; position: relative; padding: 0 10px;">
-            <div class="{pulse}" style="width: 36px; height: 36px; border-radius: 50%; background: {c["bg"]}; border: 2px solid {c["border"]}; display: flex; align-items: center; justify-content: center; margin: 0 auto 6px auto; color: {c["text"]}; font-size: 15px;">
-                {ic}
-            </div>
-            <div style="font-weight: 600; font-size: 12px; color: {c["text"]}; white-space: nowrap;">{name}</div>
-            <div style="font-size: 10px; color: #64748b; margin-top: 1px;">{c["label"]}</div>
-        </div>
-        '''
-        
-        if i < len(stages) - 1:
-            line_color = "#22c55e" if states[i+1] == 2 else ("#ef4444" if states[i+1] == 3 else ("#eab308" if states[i+1] == 1 else "#334155"))
-            html += f'''
-            <div style="flex-grow: 1; height: 2px; background: {line_color}; margin-top: -22px; min-width: 15px;"></div>
-            '''
-            
-    html += '</div>'
-    return html
-
-# Layout the status header
+# ----------------- TOP METRIC SECTION -----------------
 with st.container(border=True):
-    col_status, col_file, col_time = st.columns([1, 1, 1])
+    col_status, col_file, col_time, col_dur, col_rows = st.columns(5)
     with col_status:
-        st.markdown(f'**Pipeline Status:**  \n<div class="status-badge {pulse_class}" style="{style}">{icon} {status}</div>', unsafe_allow_html=True)
-        if status == "Pipeline failed" and error_msg:
-            # Sanitize error to prevent leaking developer info (e.g. stack traces, file paths)
-            user_friendly_error = error_msg
-            if "halted due to critical Data Quality issues" not in error_msg:
-                user_friendly_error = "An unexpected error occurred during pipeline execution. Please verify your dataset schema or check Spark logs."
-            st.caption(f"⚠️ `{user_friendly_error}`")
-
-        else:
-            st.caption(f"Sync: `{status_src}`")
+        st.metric(label="Pipeline Status", value=status_indicator)
     with col_file:
-        st.markdown(f"**Last Ingested File:**  \n`{last_file}`")
+        st.metric(label="Last Processed File", value=last_file[:25] if last_file else "None")
     with col_time:
-        st.markdown(f"**Last Successful Run:**  \n`{last_success}`")
+        st.metric(label="Last Successful Run", value=last_success if last_success != "N/A" else "N/A")
+    with col_dur:
+        dur_val = f"{duration:.2f}s" if isinstance(duration, (int, float)) else (f"{float(duration):.2f}s" if (duration != "N/A" and duration is not None and str(duration).replace('.', '', 1).isdigit()) else "N/A")
+        st.metric(label="Processing Duration", value=dur_val)
+    with col_rows:
+        st.metric(label="Records Processed", value=f"{latest_run_rows:,}" if (latest_run_rows is not None and isinstance(latest_run_rows, (int, float))) else "0")
 
-st.markdown(render_timeline_html(status, stage), unsafe_allow_html=True)
-st.divider()
+# ----------------- LIVE PROCESSING PROGRESS -----------------
+if status == "Pipeline running":
+    st.divider()
+    st.info("🟢 **Live Monitoring**\nRefreshing every 10 seconds")
+    
+    # Map raw stage to standard pipeline steps: Queued -> Bronze -> Silver -> Gold -> Completed
+    current_stage = "Queued"
+    if "queued" in status_src.lower():
+        current_stage = "Queued"
+    elif stage == "Waiting" or not stage:
+        current_stage = "Queued"
+    elif stage in ["Bronze", "Validation"]:
+        current_stage = "Bronze"
+    elif stage == "Silver":
+        current_stage = "Silver"
+    elif stage == "Gold":
+        current_stage = "Gold"
+    elif stage in ["Finished", "Completed"]:
+        current_stage = "Completed"
+    else:
+        current_stage = "Queued"
 
-if page == "Medallion Dashboard":
-    st.title("📊 Medallion Pipeline Stats")
+    stage_pcts = {
+        "Queued": 20,
+        "Bronze": 40,
+        "Silver": 60,
+        "Gold": 80,
+        "Completed": 100
+    }
+    pct = stage_pcts.get(current_stage, 20)
+    st.progress(pct)
     
-    spark = get_spark()
-    
-    # 1. Quick Start: Load Sample Data
-    with st.container(border=True):
-        st.subheader("🚀 Quick Start: Load Built-in Sample Data")
-        st.write(
-            "Load built-in mock datasets instantly to see the pipeline in action. "
-            "Clicking a button copies the CSV to `/data/input` and requests an Airflow run."
+    with st.status(f"Pipeline Processing (Active Stage: {current_stage})", expanded=True) as status_container:
+        q_icon = "🟢 Completed" if current_stage in ["Bronze", "Silver", "Gold", "Completed"] else "🟡 Running"
+        st.markdown(f"**{q_icon}: Queued**")
+        st.write("↓")
+        
+        b_icon = "🟢 Completed" if current_stage in ["Silver", "Gold", "Completed"] else ("🟡 Running" if current_stage == "Bronze" else "⚪ Pending")
+        st.markdown(f"**{b_icon}: Bronze (Raw Ingest & Quality Rules)**")
+        st.write("↓")
+        
+        s_icon = "🟢 Completed" if current_stage in ["Gold", "Completed"] else ("🟡 Running" if current_stage == "Silver" else "⚪ Pending")
+        st.markdown(f"**{s_icon}: Silver (Transform & Cleanse)**")
+        st.write("↓")
+        
+        g_icon = "🟢 Completed" if current_stage == "Completed" else ("🟡 Running" if current_stage == "Gold" else "⚪ Pending")
+        st.markdown(f"**{g_icon}: Gold (KPI Aggregations)**")
+        st.write("↓")
+        
+        c_icon = "🟢 Completed" if current_stage == "Completed" else "⚪ Pending"
+        st.markdown(f"**{c_icon}: Completed**")
+
+# ----------------- ERROR HANDLING PANEL -----------------
+def get_user_friendly_error(err):
+    if not err:
+        return "An unknown error occurred.", "Verify that the pipeline is deployed and folders are accessible."
+    err_lower = str(err).lower()
+    if "dq" in err_lower or "validation" in err_lower or "quality" in err_lower or "negative" in err_lower or "null" in err_lower:
+        return (
+            "Halted due to critical Data Quality violations in raw data.",
+            "Verify that your input file does not contain duplicate IDs, null keys, or negative ages. Run the 'Medium Sample' to test clean execution."
         )
+    elif "not found" in err_lower or "no such file" in err_lower or "missing" in err_lower:
+        return (
+            "A required storage path or Delta table directory is unavailable.",
+            "Verify that your local storage directories under data/ are mounted and writable."
+        )
+    elif "connection" in err_lower or "refused" in err_lower or "unreachable" in err_lower:
+        return (
+            "Unable to connect to the scheduling system or Spark cluster.",
+            "Check that the scheduler services and local cluster configurations are running."
+        )
+    return (
+        "An unexpected PySpark cluster or Delta Lake table write error occurred.",
+        "Check that the input format matches the expected columns (id, name, age) and that Spark cluster memory is healthy."
+    )
+
+if status == "Pipeline failed" and error_msg:
+    reason, fix = get_user_friendly_error(error_msg)
+    with st.container(border=True):
+        st.error("❌ Pipeline Failed")
+        st.markdown(f"**Reason:**\n{reason}")
+        st.markdown(f"**Suggested Fix:**\n{fix}")
+
+# ----------------- RENDER NAVIGATION PAGES -----------------
+if page == "Pipeline Dashboard":
+    st.divider()
+    
+    # Ingestion Tabs in Main Body
+    st.subheader("📥 Data Ingestion Control")
+    tab_upload, tab_sample = st.tabs(["Upload Dataset", "Use Sample Dataset"])
+    
+    with tab_upload:
+        uploaded_file = st.file_uploader("Drop CSV or JSON format file here", type=['csv', 'json'])
+        if uploaded_file is not None:
+            # Save file temporarily to extract metadata and render preview
+            temp_dir = os.path.join(INPUT_PATH, "temp")
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_path = os.path.join(temp_dir, uploaded_file.name)
+            
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+                
+            # Fetch Metadata
+            sz_mb, rows, cols = get_file_metadata(temp_path)
+            
+            # Display metadata summary
+            st.markdown(f"**File Name:** `{uploaded_file.name}`")
+            col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+            col_m1.metric("Rows", f"{rows:,}")
+            col_m2.metric("Columns", f"{cols}")
+            col_m3.metric("Type", uploaded_file.name.split('.')[-1].upper())
+            col_m4.metric("Size", f"{sz_mb:.4f} MB")
+            col_m5.metric("Est. Processing Cost", f"${rows * 0.00001:.5f} USD")
+            
+            # Preview Frame
+            st.markdown("**Dataset Preview (First 10 records):**")
+            preview_df = get_file_preview(temp_path)
+            if preview_df is not None:
+                st.dataframe(preview_df, use_container_width=True)
+            else:
+                st.info("Preview unavailable for this schema.")
+                
+            if st.button("Process Dataset", type="primary", use_container_width=True):
+                # Copy file from temp to final input folder
+                final_path = os.path.join(INPUT_PATH, uploaded_file.name)
+                shutil.move(temp_path, final_path)
+                st.session_state.last_uploaded_file = uploaded_file.name
+                
+                # Trigger pipeline
+                triggered = False
+                msg = ""
+                if api_url:
+                    from airflow_client import trigger_airflow_dag
+                    triggered, msg = trigger_airflow_dag(api_url, username, password)
+                    
+                if triggered:
+                    st.success(f"File uploaded and Pipeline Scheduler triggered successfully!")
+                else:
+                    st.info(f"File saved to input directory. Sync bypassed: {msg or 'API offline/disabled'}.")
+                
+                time.sleep(1)
+                st.rerun()
+                
+    with tab_sample:
+        st.write("Load one of the project's pre-packaged datasets directly into the pipeline:")
         
-        from pipeline.config import SAMPLES_PATH, INPUT_PATH
-        import shutil
-        
-        def load_sample(size_label, file_name):
-            src = os.path.join(SAMPLES_PATH, file_name)
-            dest = os.path.join(INPUT_PATH, file_name)
+        # Loader trigger helper
+        def run_sample(label, file):
+            src = os.path.join(SAMPLES_PATH, file)
+            dest = os.path.join(INPUT_PATH, file)
             try:
                 os.makedirs(INPUT_PATH, exist_ok=True)
                 shutil.copy(src, dest)
-                st.session_state.last_uploaded_file = file_name
-                
-                api_url = st.session_state.airflow_api_url if st.session_state.use_airflow_api else None
-                username = st.session_state.airflow_username
-                password = st.session_state.airflow_password
+                st.session_state.last_uploaded_file = file
                 
                 triggered = False
                 msg = ""
                 if api_url:
                     from airflow_client import trigger_airflow_dag
                     triggered, msg = trigger_airflow_dag(api_url, username, password)
-                
+                    
                 if triggered:
-                    st.toast(f"Successfully loaded {size_label} dataset and triggered DAG run!", icon="🚀")
-                    st.success(f"Loaded {size_label} dataset and successfully triggered Airflow DAG! ({msg})")
+                    st.toast(f"Loading {label} sample dataset...", icon="🚀")
                 else:
-                    st.toast(f"Sample copied to input folder.", icon="📥")
-                    st.info(f"Loaded {size_label} dataset to `/data/input`. (Bypassed API sync: {msg or 'API offline'})")
-                    st.warning("Airflow API is offline or disabled. Airflow will pick up the file on its next periodic sensor poke, or click 'Run Pipeline Now' in the sidebar.")
-                
+                    st.toast(f"{label} dataset placed in input directory.", icon="📥")
+                    
                 time.sleep(1)
                 st.rerun()
-            except Exception as ex:
-                st.error(f"Failed to load sample: {str(ex)}")
+            except Exception as e:
+                st.error(f"Failed to load sample: {str(e)}")
 
-        col_btn1, col_btn2, col_btn3 = st.columns(3)
-        with col_btn1:
-            st.button("📈 Load Small CSV (100 rows)", use_container_width=True, on_click=load_sample, args=("Small CSV", "small_sample.csv"), help="Contains duplicates & negative ages to test DQ rules.")
-        with col_btn2:
-            st.button("📊 Load Medium CSV (10K rows)", use_container_width=True, on_click=load_sample, args=("Medium CSV", "medium_sample.csv"), help="Tests intermediate PySpark aggregation performance.")
-        with col_btn3:
-            st.button("⚡ Load Large CSV (100K+ rows)", use_container_width=True, on_click=load_sample, args=("Large CSV", "large_sample.csv"), help="Demonstrates high-volume Delta Lake processing scales.")
-            
-        col_json1, col_json2, _ = st.columns(3)
-        with col_json1:
-            st.button("📋 Load Small JSON (100 rows)", use_container_width=True, on_click=load_sample, args=("Small JSON", "small_sample.json"), help="Newline-delimited JSON format testing DQ features.")
-        with col_json2:
-            st.button("📂 Load Medium JSON (10K rows)", use_container_width=True, on_click=load_sample, args=("Medium JSON", "medium_sample.json"), help="Newline-delimited JSON format testing Spark aggregations.")
-
-            
-    # 2. Dataset Information & System Health (2 columns)
-    col_info, col_health = st.columns(2)
-    
-    with col_info:
-        with st.container(border=True):
-            st.subheader("ℹ️ Dataset Information")
-            
-            # Find the path of the last file
-            last_file_path = None
-            for folder in [INPUT_PATH, ARCHIVE_PATH]:
-                if last_file and last_file != "None":
-                    fp = os.path.join(folder, last_file)
-                    if os.path.exists(fp):
-                        last_file_path = fp
-                        break
-            
-            file_size, record_count = 0.0, 0
-            if last_file_path:
-                file_size, record_count = get_file_metadata(last_file_path)
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            with st.container(border=True):
+                st.markdown("##### 📈 Small Sample (100 rows)")
+                st.write("Contains duplicate entries and null rows to evaluate Data Quality validation blocks.")
+                st.write("**Est. Ingestion Time:** `~2 seconds`")
+                st.write("**Processing Cost:** `$0.001 USD`")
+                st.divider()
+                st.button("Load Small CSV", type="secondary", use_container_width=True, on_click=run_sample, args=("Small CSV", "small_sample.csv"))
+                st.button("Load Small JSON", type="secondary", use_container_width=True, on_click=run_sample, args=("Small JSON", "small_sample.json"))
                 
-            st.markdown(f"**Active File:** `{last_file}`")
-            st.markdown(f"**Total Records:** `{record_count:,}`")
-            st.markdown(f"**Size on Disk:** `{file_size:.4f} MB`")
-            
-            loc = "Input Ingest (/data/input)" if status == "Pipeline running" else "Archive Folder (/data/archive)"
-            st.markdown(f"**File Location:** `{loc}`")
-            
-    with col_health:
+        with col_s2:
+            with st.container(border=True):
+                st.markdown("##### 📊 Medium Sample (10K rows)")
+                st.write("Clean records demonstrating Spark execution metrics and cleansing workflows.")
+                st.write("**Est. Ingestion Time:** `~5 seconds`")
+                st.write("**Processing Cost:** `$0.10 USD`")
+                st.divider()
+                st.button("Load Medium CSV", type="secondary", use_container_width=True, on_click=run_sample, args=("Medium CSV", "medium_sample.csv"))
+                st.button("Load Medium JSON", type="secondary", use_container_width=True, on_click=run_sample, args=("Medium JSON", "medium_sample.json"))
+                
+        with col_s3:
+            with st.container(border=True):
+                st.markdown("##### ⚡ Large Sample (100K rows)")
+                st.write("Large data block designed to evaluate PySpark Delta Lake scaling limits.")
+                st.write("**Est. Ingestion Time:** `~15 seconds`")
+                st.write("**Processing Cost:** `$1.00 USD`")
+                st.divider()
+                st.button("Load Large CSV", type="secondary", use_container_width=True, on_click=run_sample, args=("Large CSV", "large_sample.csv"))
+
+    # System Health Panel & Dataset Information
+    st.divider()
+    col_system, col_info = st.columns(2)
+    with col_system:
         with st.container(border=True):
-            st.subheader("🏥 System Health")
+            st.subheader("🏥 System Health Monitor")
             
-            # Airflow API Health
-            airflow_active = False
+            # Health check variables
+            airflow_status = "🔴 Disconnected"
             if st.session_state.use_airflow_api:
                 from airflow_client import test_airflow_connection
-                airflow_active, _ = test_airflow_connection(
+                success, _ = test_airflow_connection(
                     st.session_state.airflow_api_url,
                     st.session_state.airflow_username,
                     st.session_state.airflow_password
                 )
-            airflow_text = "🟢 Active (REST API)" if airflow_active else "🔴 Offline (Using File Fallback)"
+                if success:
+                    airflow_status = "🟢 Connected"
             
-            # Spark Health
-            spark_active = spark is not None
-            spark_text = "🟢 Active (PySpark Catalogs)" if spark_active else "🔴 Offline"
+            spark_status = "🟢 Available" if spark is not None else "🔴 Unavailable"
+            input_writable = "🟢 Accessible" if os.access(INPUT_PATH, os.W_OK) else "🔴 Inaccessible"
             
-            # Data Lake health
-            lake_ok = os.path.exists(GOLD_PATH) and os.path.exists(SILVER_PATH)
-            lake_text = "🟢 Active (Gold Lakehouse Available)" if lake_ok else "🔴 Missing Lake Tables"
+            output_dir = os.path.dirname(STATUS_FILE)
+            output_writable = "🟢 Accessible" if os.access(output_dir, os.W_OK) else "🔴 Inaccessible"
             
-            st.markdown(f"**Airflow Sync Status:** {airflow_text}")
-            st.markdown(f"**Spark SQL Cluster:** {spark_text}")
-            st.markdown(f"**Delta Storage Lake:** {lake_text}")
+            st.markdown(f"**Airflow Connection:** {airflow_status}")
+            st.markdown(f"**Spark Availability:** {spark_status}")
+            st.markdown(f"**Input Folder Access:** {input_writable}")
+            st.markdown(f"**Output Folder Access:** {output_writable}")
+
+    with col_info:
+        with st.container(border=True):
+            st.subheader("ℹ️ Dataset Information")
             
-            from datetime import datetime
-            st.caption(f"Last Health Check: `{datetime.now().strftime('%H:%M:%S')}`")
+            active_file = get_last_uploaded_file()
+            rows_val, cols_val, type_val, cost_val, time_val = "N/A", "N/A", "N/A", "N/A", "N/A"
             
+            if active_file:
+                filepath = os.path.join(INPUT_PATH, active_file)
+                if not os.path.exists(filepath):
+                    filepath = os.path.join(ARCHIVE_PATH, active_file)
+                
+                if os.path.exists(filepath):
+                    sz_mb, r_cnt, c_cnt = get_file_metadata(filepath)
+                    rows_val = f"{r_cnt:,}"
+                    cols_val = f"{c_cnt}"
+                    type_val = active_file.split('.')[-1].upper() if '.' in active_file else "Unknown"
+                    cost_val = f"${max(0.001, r_cnt * 0.00001):.4f} USD"
+                    time_val = f"~{max(2, int(r_cnt / 10000 * 1.5))} seconds"
+                    
+            st.markdown(f"**Active File:** `{active_file or 'None'}`")
+            st.markdown(f"**Rows:** `{rows_val}`")
+            st.markdown(f"**Columns:** `{cols_val}`")
+            st.markdown(f"**File Type:** `{type_val}`")
+            st.markdown(f"**Estimated Processing Cost:** `{cost_val}`")
+            st.markdown(f"**Estimated Processing Time:** `{time_val}`")
+
     st.divider()
     
-    # 3. KPI Row & Processing metrics
-    st.subheader("📋 Pipeline Monitoring")
-    b_runtime, b_total = get_kpis(spark)
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Pipeline Runtime", f"{b_runtime}s")
-        c2.metric("Silver Inventory", f"{b_total:,}")
-        
-        # Duration from consolidated status
-        c3.metric("Last Run Duration", f"{duration}s" if duration != "N/A" else "N/A")
-        
-        # Current stage indicator
-        c4.metric("Active Stage", f"{stage}")
-    
     # Medallion Tabs
+    st.subheader("📊 Lakehouse Visualizations")
     tabs = st.tabs([
-        ":material/layers: Bronze (Raw)", 
-        ":material/cleaning_services: Silver (Cleaned)", 
-        ":material/trending_up: Gold (Trends)"
+        "Bronze Layer (Raw)", 
+        "Silver Layer (Cleaned)", 
+        "Gold Layer (Metrics)"
     ])
     
-
     with tabs[0]:
         with st.container(border=True):
-            st.subheader("Raw Ingestion Feed")
+            st.subheader("Raw Ingest Inbound Log")
             df = load_layer_data(spark, BRONZE_PATH)
             if df is not None:
                 from pyspark.sql.functions import col
                 total_raw = df.count()
-                st.metric("Total Raw Records", f"{total_raw:,}")
+                st.metric("Total Ingested Records", f"{total_raw:,}")
                 sorted_df = df.orderBy(col("ingestion_time").desc()).limit(100).toPandas()
                 st.dataframe(sorted_df, use_container_width=True)
             else:
-                st.info("Bronze data not available.", icon=":material/info:")
+                st.info("Bronze layer data is currently empty.")
             
     with tabs[1]:
         df = load_layer_data(spark, SILVER_PATH)
         if df is not None:
             from pyspark.sql.functions import col
             df_sorted = df.orderBy(col("processed_date").desc(), col("id"))
-            
             full_pdf = df_sorted.toPandas()
             total_cleaned = len(full_pdf)
             
@@ -438,33 +431,28 @@ if page == "Medallion Dashboard":
                 with col_btn:
                     csv_data = convert_df_to_csv(full_pdf)
                     st.download_button(
-                        label="Download Full Silver CSV",
+                        label="Download Silver Table CSV",
                         data=csv_data,
-                        file_name="silver_cleaned_data_full.csv",
+                        file_name="silver_table_cleaned.csv",
                         mime="text/csv",
-                        icon=":material/download:",
                         type="primary"
                     )
-                
                 with col_slider:
-                    age_range = st.slider("Interactive Filter: Select Age Range", 0, 120, (18, 65), key="silver_age_slider")
+                    age_range = st.slider("Interactive Filter: Select Age Scope", 0, 120, (18, 65), key="silver_age_slider")
                 
-                # Apply filter to display dataset
                 filtered_pdf = full_pdf[(full_pdf['age'] >= age_range[0]) & (full_pdf['age'] <= age_range[1])]
                 
-                # Display Summary Statistics
-                c_rows, c_avg, c_min, c_max = st.columns(4)
-                c_rows.metric("Filtered Records", f"{len(filtered_pdf):,}")
-                c_avg.metric("Average Filtered Age", f"{filtered_pdf['age'].mean():.1f} yrs" if len(filtered_pdf) > 0 else "N/A")
-                c_min.metric("Minimum Filtered Age", f"{int(filtered_pdf['age'].min())} yrs" if len(filtered_pdf) > 0 else "N/A")
-                c_max.metric("Maximum Filtered Age", f"{int(filtered_pdf['age'].max())} yrs" if len(filtered_pdf) > 0 else "N/A")
+                # Statistics Metrics
+                m_avg, m_min, m_max = st.columns(3)
+                m_avg.metric("Average User Age", f"{filtered_pdf['age'].mean():.1f} yrs" if len(filtered_pdf) > 0 else "N/A")
+                m_min.metric("Minimum User Age", f"{int(filtered_pdf['age'].min())} yrs" if len(filtered_pdf) > 0 else "N/A")
+                m_max.metric("Maximum User Age", f"{int(filtered_pdf['age'].max())} yrs" if len(filtered_pdf) > 0 else "N/A")
                 
-                # Display limited dataframe in UI for performance
                 display_pdf = filtered_pdf.head(1000)
                 st.plotly_chart(plot_age_distribution(display_pdf), use_container_width=True)
                 st.dataframe(display_pdf.head(100), use_container_width=True)
         else:
-            st.info("Silver data not available.", icon=":material/info:")
+            st.info("Silver layer data is currently empty.")
             
     with tabs[2]:
         df = load_layer_data(spark, GOLD_PATH)
@@ -474,21 +462,52 @@ if page == "Medallion Dashboard":
                 # Summary Statistics for Gold
                 g1, g2, g3 = st.columns(3)
                 g1.metric("Average Gold Age", f"{pdf['average_age'].mean():.1f} yrs" if not pdf.empty else "N/A")
-                g2.metric("Total Gold Users", f"{pdf['total_users'].sum():,}" if not pdf.empty else "N/A")
-                g3.metric("Aggregated Process Dates", f"{len(pdf)}" if not pdf.empty else "N/A")
+                g2.metric("Total Managed Users", f"{pdf['total_users'].sum():,}" if not pdf.empty else "N/A")
+                g3.metric("Aggregated Dates", f"{len(pdf)}" if not pdf.empty else "N/A")
                 
                 st.plotly_chart(plot_gold_trends(pdf), use_container_width=True)
                 st.dataframe(pdf, use_container_width=True)
         else:
-            st.info("Gold data not available.", icon=":material/info:")
+            st.info("Gold layer metrics are currently empty.")
 
-elif page == "Processed Files History":
+    # 5. Pipeline Run History (Bottom of Main Dashboard)
+    st.divider()
+    st.subheader("📋 Recent Pipeline Runs")
+    if history_records:
+        history_table_data = []
+        for r in history_records:
+            t_str = datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+            status_text = "🟢 Completed" if r.get("status") == "completed" else "🔴 Failed"
+            
+            rows_val = r.get("rows", 0)
+            rows_str = f"{rows_val:,}" if (rows_val is not None and isinstance(rows_val, (int, float))) else "0"
+            
+            dur_val = r.get("duration", "N/A")
+            if isinstance(dur_val, (int, float)):
+                dur_str = f"{dur_val:.2f}s"
+            else:
+                dur_str = str(dur_val)
+                if dur_str.replace('.', '', 1).isdigit():
+                    dur_str = f"{float(dur_str):.2f}s"
+                else:
+                    dur_str = "N/A"
+                
+            history_table_data.append({
+                "Timestamp": t_str,
+                "File Name": r.get("file_name") or "Unknown",
+                "Status": status_text,
+                "Duration": dur_str,
+                "Rows Processed": rows_str
+            })
+        st.dataframe(pd.DataFrame(history_table_data), use_container_width=True)
+    else:
+        st.info("No runs logged yet.")
+
+elif page == "Delta Lake Transaction Log":
     from delta.tables import DeltaTable
     
-    st.title(":material/history: Delta Transaction Log")
-    st.write("Dynamic execution history retrieved from Delta Lake metadata.")
-    
-    spark = get_spark()
+    st.title("🛡️ Delta Lake Transaction Log")
+    st.write("Dynamic execution history retrieved directly from Delta Lake metadata logs.")
     
     try:
         dt_silver = DeltaTable.forPath(spark, SILVER_PATH)
@@ -520,20 +539,16 @@ elif page == "Processed Files History":
                 with st.container(border=True):
                     st.bar_chart(df_files.set_index("Timestamp")["Rows Written"])
         else:
-            st.info("No processing history found.", icon=":material/info:")
+            st.info("No processing history found in Delta catalog.")
             
     except Exception as e:
-        st.error(f"Error loading history: {str(e)}", icon=":material/error:")
+        st.error(f"Error loading Delta history: {str(e)}")
 
-elif page == "Data Engineering Infographics":
-    from charts import plot_data_funnel, plot_pipeline_history, plot_dq_violations
+elif page == "Pipeline Analytics":
     from delta.tables import DeltaTable
-    from pipeline.config import DQ_METRICS_PATH
     from pyspark.sql.functions import col
     
-    st.title(":material/insights: Pipeline Infographics")
-    
-    spark = get_spark()
+    st.title("📊 Pipeline Analytics")
     
     # Calculate counts
     bronze_cnt = spark.read.format("delta").load(BRONZE_PATH).count() if os.path.exists(BRONZE_PATH) else 0
@@ -548,16 +563,16 @@ elif page == "Data Engineering Infographics":
             if not dq_df.empty:
                 latest = dq_df.iloc[0]
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Null IDs", int(latest['null_ids']))
-                c2.metric("Neg. Ages", int(latest['negative_ages']))
-                c3.metric("Inv. Ages", int(latest['invalid_ages']))
-                c4.metric("Duplicates", int(latest['duplicate_ids']))
+                c1.metric("Null IDs Detected", int(latest['null_ids']))
+                c2.metric("Neg. Ages Detected", int(latest['negative_ages']))
+                c3.metric("Inv. Ages Detected", int(latest['invalid_ages']))
+                c4.metric("Duplicates Filtered", int(latest['duplicate_ids']))
                 
                 st.plotly_chart(plot_dq_violations(latest), use_container_width=True)
             else:
-                st.info("No DQ metrics captured yet.", icon=":material/info:")
+                st.info("No DQ metrics captured yet.")
         except Exception:
-            st.info("DQ metrics unavailable.", icon=":material/info:")
+            st.info("DQ metrics unavailable.")
 
     col_funnel, col_history = st.columns(2)
     
@@ -585,14 +600,11 @@ elif page == "Data Engineering Infographics":
                 if fig:
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.info("No volume history available.", icon=":material/info:")
+                    st.info("No volume history available.")
         except Exception:
-            st.info("Volume history unavailable.", icon=":material/info:")
+            st.info("Volume history unavailable.")
 
-# Automatic Refresh Loop
+# ----------------- AUTO-REFRESH TRIGGER -----------------
 if status == "Pipeline running":
-    st.info("🔄 Pipeline is processing. This page will refresh automatically every 5 seconds.")
-    time.sleep(5)
+    time.sleep(10)
     st.rerun()
-
-
