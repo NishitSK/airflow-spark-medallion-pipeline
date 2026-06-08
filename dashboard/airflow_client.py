@@ -171,6 +171,8 @@ def check_dag_safety(api_url="http://airflow:8080", username="admin", password="
             if is_paused:
                 return False, f"DAG '{dag_id}' is paused. Please unpause it in the Airflow UI."
             return True, None
+        elif response.status_code == 401:
+            return False, "Authentication failed. Please verify your Scheduler API Username and Password in the Sidebar Connection Settings."
         elif response.status_code == 404:
             v1_url = f"{api_url.rstrip('/')}/api/v1/dags/{dag_id}"
             response = requests.get(v1_url, headers=headers, timeout=3, verify=False)
@@ -180,6 +182,8 @@ def check_dag_safety(api_url="http://airflow:8080", username="admin", password="
                 if is_paused:
                     return False, f"DAG '{dag_id}' is paused. Please unpause it in the Airflow UI."
                 return True, None
+            elif response.status_code == 401:
+                return False, "Authentication failed. Please verify your Scheduler API Username and Password in the Sidebar Connection Settings."
             elif response.status_code == 404:
                 return False, f"DAG '{dag_id}' not found on the Airflow server."
             return False, f"Airflow API check failed (HTTP {response.status_code})."
