@@ -62,3 +62,31 @@ def plot_pipeline_history(history_df):
         font=dict(color="#e0e0e0")
     )
     return fig
+
+def plot_dq_trends(df):
+    """
+    Plots Data Quality metrics over time (Quality Score, Null Rate, Duplicate Rate, Failure Rate).
+    """
+    import plotly.graph_objects as go
+    
+    if df is None or df.empty:
+        return None
+        
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['Quality Score (%)'], mode='lines+markers', name='Quality Score (%)', line=dict(color='#00CC96', width=2.5)))
+    fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['Null Rate (%)'], mode='lines+markers', name='Null Rate (%)', line=dict(color='#636EFA', width=2)))
+    fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['Duplicate Rate (%)'], mode='lines+markers', name='Duplicate Rate (%)', line=dict(color='#EF553B', width=2)))
+    fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['Failure Rate (%)'], mode='lines+markers', name='Failure Rate (%)', line=dict(color='#AB63FA', width=2, dash='dash')))
+    
+    fig.update_layout(
+        title="Data Quality Trends (Quality Score, Null Rate, Duplicate Rate, Failure Rate)",
+        xaxis_title="Run Time",
+        yaxis_title="Percentage (%)",
+        yaxis=dict(range=[-2, 105]),
+        template="plotly_dark",
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(color="#e0e0e0"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    return fig

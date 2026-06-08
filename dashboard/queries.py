@@ -333,5 +333,114 @@ def get_pipeline_history(spark):
     runs.sort(key=lambda x: x.get("timestamp", 0.0), reverse=True)
     return runs[:20]
 
+def get_dq_audit_details(spark):
+    """
+    Analyzes Bronze table to find malformed records and duplicate key samples.
+    """
+    from pyspark.sql.functions import col, regexp_replace, trim, count
+    import pandas as pd
+    
+    audit_data = {
+        "malformed_ids": {"count": 0, "samples": []},
+        "malformed_ages": {"count": 0, "samples": []},
+        "duplicate_ids": {"count": 0, "samples": []}
+    }
+    
+    try:
+        if not os.path.exists(BRONZE_PATH):
+            return audit_data
+            
+        df = spark.read.format("delta").load(BRONZE_PATH)
+        total_rows = df.count()
+        if total_rows == 0:
+            return audit_data
+            
+        # 1. Malformed IDs
+        cleaned_id = regexp_replace(trim(col("id")), r"\.0+$", "")
+        parsed_id = cleaned_id.cast("int")
+        is_malformed_id = parsed_id.isNull() & col("id").isNotNull() & (trim(col("id")) != "")
+        
+        malformed_ids_df = df.filter(is_malformed_id)
+        audit_data["malformed_ids"]["count"] = malformed_ids_df.count()
+        if audit_data["malformed_ids"]["count"] > 0:
+            samples = malformed_ids_df.select("id", "name").limit(5).collect()
+            audit_data["malformed_ids"]["samples"] = [{"id": r["id"], "name": r["name"]} for r in samples]
+            
+        # 2. Malformed Ages
+        cleaned_age = regexp_replace(trim(col("age")), r"\.0+$", "")
+        parsed_age = cleaned_age.cast("int")
+        is_malformed_age = parsed_age.isNull() & col("age").isNotNull() & (trim(col("age")) != "")
+        
+        malformed_ages_df = df.filter(is_malformed_age)
+        audit_data["malformed_ages"]["count"] = malformed_ages_df.count()
+        if audit_data["malformed_ages"]["count"] > 0:
+            samples = malformed_ages_df.select("age", "name").limit(5).collect()
+            audit_data["malformed_ages"]["samples"] = [{"age": r["age"], "name": r["name"]} for r in samples]
+            
+        # 3. Duplicate IDs (duplicates on normalized ID)
+        normalized_df = df.withColumn("normalized_id", regexp_replace(trim(col("id")), r"\.0+$", ""))
+        # Filter keys with count > 1
+        dup_keys_df = normalized_df.groupBy("normalized_id").agg(count("*").alias("occurrences")).filter("occurrences > 1")
+        audit_data["duplicate_ids"]["count"] = dup_keys_df.count()
+        if audit_data["duplicate_ids"]["count"] > 0:
+            # Join back to get names and raw ids for duplicate samples
+            sample_dupes = normalized_df.join(dup_keys_df, "normalized_id").select("id", "name", "occurrences").limit(5).collect()
+            audit_data["duplicate_ids"]["samples"] = [{"raw_id": r["id"], "name": r["name"], "occurrences": r["occurrences"]} for r in sample_dupes]
+            
+    except Exception as e:
+        print(f"Error fetching DQ audit details: {str(e)}")
+        
+    return audit_data
+
+def get_dq_trends(spark):
+    """
+    Retrieves all history validation metrics from DQ_METRICS_PATH.
+    """
+    from pyspark.sql.functions import col
+    import pandas as pd
+    import numpy as np
+    
+    try:
+        if os.path.exists(DQ_METRICS_PATH):
+            df = spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").asc()).toPandas()
+            if not df.empty:
+                # Replace 0 total_rows with NaN to prevent divide-by-zero
+                total = df['total_rows'].replace(0, np.nan)
+                
+                # Metrics percentage calculations
+                df['Null Rate (%)'] = (df['null_ids'] / total * 100).fillna(0.0)
+                df['Duplicate Rate (%)'] = (df['duplicate_ids'] / total * 100).fillna(0.0)
+                df['Invalid Age Rate (%)'] = (df['invalid_ages'] / total * 100).fillna(0.0)
+                
+                # Quality Score = (Passed Rows / Total Rows) * 100
+                # Passed Rows = Total - (nulls + invalid age + duplicates)
+                failed_records = df['null_ids'] + df['invalid_ages'] + df['duplicate_ids']
+                passed_records = (df['total_rows'] - failed_records).clip(lower=0)
+                df['Quality Score (%)'] = (passed_records / total * 100).fillna(100.0)
+                df['Failure Rate (%)'] = (failed_records / total * 100).fillna(0.0)
+                
+                # Formatting validation time
+                df['Timestamp'] = pd.to_datetime(df['validation_time']).dt.strftime('%m-%d %H:%M:%S')
+                return df
+    except Exception as e:
+        print(f"Error fetching DQ trends: {str(e)}")
+    return pd.DataFrame()
+
+def get_incidents(spark):
+    """
+    Retrieves logged incidents and execution traces from TRACE_PATH.
+    """
+    from pyspark.sql.functions import col
+    import pandas as pd
+    
+    try:
+        if os.path.exists(TRACE_PATH):
+            df = spark.read.format("delta").load(TRACE_PATH)
+            incidents_df = df.orderBy(col("timestamp").desc()).limit(20).toPandas()
+            return incidents_df
+    except Exception as e:
+        print(f"Error fetching incidents: {str(e)}")
+    return pd.DataFrame()
+
 
 

@@ -29,23 +29,44 @@ def validate_data(spark=None):
 
         # DQ Checks on raw String fields
         # Clean float formats (e.g. 1001.0 -> 1001) for numeric checks
-        cleaned_id = regexp_replace(col("id"), r"\.0+$", "")
+        cleaned_id = regexp_replace(trim(col("id")), r"\.0+$", "")
         parsed_id = cleaned_id.cast("int")
         
-        cleaned_age = regexp_replace(col("age"), r"\.0+$", "")
+        cleaned_age = regexp_replace(trim(col("age")), r"\.0+$", "")
         parsed_age = cleaned_age.cast("int")
 
-        # Determine invalid age: out of bounds, or non-numeric (fails to cast to int when not empty)
-        is_invalid_age = (parsed_age > 120) | (parsed_age.isNull() & col("age").isNotNull() & (trim(col("age")) != ""))
+        # Determine malformed ID (not empty, but fails to parse to int)
+        is_malformed_id = parsed_id.isNull() & col("id").isNotNull() & (trim(col("id")) != "")
+        
+        # Determine malformed age (not empty, but fails to parse to int)
+        is_malformed_age = parsed_age.isNull() & col("age").isNotNull() & (trim(col("age")) != "")
+
+        # Determine invalid age: out of bounds, or malformed/non-numeric
+        is_invalid_age = (parsed_age > 120) | is_malformed_age
 
         dq_results = df.select(
-            _sum(when(col("id").isNull() | (trim(col("id")) == ""), 1).otherwise(0)).alias("null_ids"),
+            _sum(when(parsed_id.isNull(), 1).otherwise(0)).alias("null_ids"),
             _sum(when(parsed_age < 0, 1).otherwise(0)).alias("negative_ages"),
             _sum(when(is_invalid_age, 1).otherwise(0)).alias("invalid_ages")
         ).collect()[0]
 
-        # Duplicate check
-        dupe_count = total_rows - df.dropDuplicates(["id"]).count()
+        # Logging malformed IDs defensively
+        malformed_id_count = df.filter(is_malformed_id).count()
+        if malformed_id_count > 0:
+            print(f"WARNING: {malformed_id_count} records had malformed IDs that fail conversion to integers.")
+            sample_malformed = df.filter(is_malformed_id).select("id", "name").limit(5).collect()
+            print("Sample malformed IDs in Bronze: " + ", ".join([f"'{r['id']}' ({r['name']})" for r in sample_malformed]))
+
+        # Logging malformed ages defensively
+        malformed_age_count = df.filter(is_malformed_age).count()
+        if malformed_age_count > 0:
+            print(f"WARNING: {malformed_age_count} records had malformed ages that fail conversion to integers.")
+            sample_malformed_age = df.filter(is_malformed_age).select("age", "name").limit(5).collect()
+            print("Sample malformed ages in Bronze: " + ", ".join([f"'{r['age']}' ({r['name']})" for r in sample_malformed_age]))
+
+        # Duplicate check on normalized ID
+        normalized_df = df.withColumn("normalized_id", regexp_replace(trim(col("id")), r"\.0+$", ""))
+        dupe_count = total_rows - normalized_df.dropDuplicates(["normalized_id"]).count()
 
         # Prepare metrics dataframe
         from pyspark.sql.functions import current_timestamp

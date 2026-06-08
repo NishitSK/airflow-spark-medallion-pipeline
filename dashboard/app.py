@@ -15,14 +15,18 @@ from queries import (
     get_file_metadata, 
     get_file_preview, 
     get_pipeline_history,
-    get_last_uploaded_file
+    get_last_uploaded_file,
+    get_dq_audit_details,
+    get_dq_trends,
+    get_incidents
 )
 from charts import (
     plot_age_distribution, 
     plot_gold_trends, 
     plot_data_funnel, 
     plot_pipeline_history, 
-    plot_dq_violations
+    plot_dq_violations,
+    plot_dq_trends
 )
 from pipeline.config import (
     BRONZE_PATH, 
@@ -33,7 +37,8 @@ from pipeline.config import (
     HISTORY_FILE, 
     DQ_METRICS_PATH, 
     ARCHIVE_PATH,
-    STATUS_FILE
+    STATUS_FILE,
+    TRACE_PATH
 )
 
 st.set_page_config(
@@ -66,7 +71,7 @@ with st.sidebar:
     
     page = st.radio(
         "Navigation", 
-        ["Pipeline Dashboard", "Delta Lake Transaction Log", "Pipeline Analytics"],
+        ["Pipeline Dashboard", "Delta Lake Transaction Log", "Data Quality & Observability"],
         index=0
     )
     
@@ -546,65 +551,250 @@ elif page == "Delta Lake Transaction Log":
     except Exception as e:
         st.error(f"Error loading Delta history: {str(e)}")
 
-elif page == "Pipeline Analytics":
+elif page == "Data Quality & Observability":
     from delta.tables import DeltaTable
     from pyspark.sql.functions import col
     
-    st.title("📊 Pipeline Analytics")
+    st.title("🛡️ Data Quality & Observability Portal")
+    st.write("Comprehensive metrics, lineages, and audit trails generated from your Lakehouse layers.")
     
     # Calculate counts
     bronze_cnt = spark.read.format("delta").load(BRONZE_PATH).count() if os.path.exists(BRONZE_PATH) else 0
     silver_cnt = spark.read.format("delta").load(SILVER_PATH).count() if os.path.exists(SILVER_PATH) else 0
     gold_cnt = spark.read.format("delta").load(GOLD_PATH).count() if os.path.exists(GOLD_PATH) else 0
     
-    # Layout with DQ at top
-    with st.container(border=True):
-        st.subheader("Data Quality Pulse")
-        try:
+    # Fetch latest validation metrics from dq_metrics path
+    latest_dq = None
+    try:
+        if os.path.exists(DQ_METRICS_PATH):
             dq_df = spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").desc()).limit(1).toPandas()
             if not dq_df.empty:
-                latest = dq_df.iloc[0]
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Null IDs Detected", int(latest['null_ids']))
-                c2.metric("Neg. Ages Detected", int(latest['negative_ages']))
-                c3.metric("Inv. Ages Detected", int(latest['invalid_ages']))
-                c4.metric("Duplicates Filtered", int(latest['duplicate_ids']))
-                
-                st.plotly_chart(plot_dq_violations(latest), use_container_width=True)
-            else:
-                st.info("No DQ metrics captured yet.")
-        except Exception:
-            st.info("DQ metrics unavailable.")
+                latest_dq = dq_df.iloc[0]
+    except Exception as e:
+        print(f"Error reading DQ metrics: {e}")
+        
+    # Calculate passed and failed values based on latest dq run
+    if latest_dq is not None:
+        total_validated = int(latest_dq["total_rows"])
+        null_ids = int(latest_dq["null_ids"])
+        invalid_ages = int(latest_dq["invalid_ages"])
+        duplicate_ids = int(latest_dq["duplicate_ids"])
+        
+        failed_records = null_ids + invalid_ages + duplicate_ids
+        passed_records = max(0, total_validated - failed_records)
+        
+        null_rate = (null_ids / total_validated * 100) if total_validated > 0 else 0.0
+        dup_rate = (duplicate_ids / total_validated * 100) if total_validated > 0 else 0.0
+        inv_age_rate = (invalid_ages / total_validated * 100) if total_validated > 0 else 0.0
+        
+        dq_score = (passed_records / total_validated * 100) if total_validated > 0 else 100.0
+    else:
+        total_validated = bronze_cnt
+        passed_records = silver_cnt
+        failed_records = max(0, bronze_cnt - silver_cnt)
+        null_ids = 0
+        invalid_ages = 0
+        duplicate_ids = 0
+        null_rate = 0.0
+        dup_rate = 0.0
+        inv_age_rate = 0.0
+        dq_score = (passed_records / total_validated * 100) if total_validated > 0 else 100.0
 
-    col_funnel, col_history = st.columns(2)
+    # ----------------- SECTION 1: SYSTEM HEALTH & INCIDENT REPORTING -----------------
+    st.divider()
+    col_sys_health, col_incident_panel = st.columns([2, 3])
     
-    with col_funnel:
+    with col_sys_health:
+        with st.container(border=True):
+            st.subheader("🏥 Operational Monitoring")
+            
+            # Connection statuses
+            airflow_status = "🔴 Disconnected"
+            if st.session_state.use_airflow_api:
+                from airflow_client import test_airflow_connection
+                success, _ = test_airflow_connection(
+                    st.session_state.airflow_api_url,
+                    st.session_state.airflow_username,
+                    st.session_state.airflow_password
+                )
+                if success:
+                    airflow_status = "🟢 Connected"
+                    
+            spark_status = "🟢 Available" if spark is not None else "🔴 Unavailable"
+            
+            # Check Data Lake directories readability
+            dl_status = "🟢 Accessible"
+            for p in [BRONZE_PATH, SILVER_PATH, GOLD_PATH]:
+                if os.path.exists(p):
+                    if not os.access(p, os.R_OK):
+                        dl_status = "🔴 Inaccessible"
+                        break
+                else:
+                    parent = os.path.dirname(p)
+                    if os.path.exists(parent) and not os.access(parent, os.W_OK):
+                        dl_status = "🔴 Inaccessible"
+                        break
+            
+            dur_val = f"{duration:.2f}s" if isinstance(duration, (int, float)) else (f"{float(duration):.2f}s" if (duration != "N/A" and duration is not None and str(duration).replace('.', '', 1).isdigit()) else "N/A")
+            
+            st.markdown(f"**Airflow Scheduler:** {airflow_status}")
+            st.markdown(f"**Spark SQL Engine:** {spark_status}")
+            st.markdown(f"**Data Lake Catalog:** {dl_status}")
+            st.markdown(f"**Last Run Duration:** `{dur_val}`")
+            st.markdown(f"**Current Pipeline State:** `{status_indicator}`")
+
+    with col_incident_panel:
+        with st.container(border=True):
+            st.subheader("🚨 DQ Incident Reporting")
+            
+            if status == "Pipeline failed":
+                st.error("❌ Critical Data Quality Failure")
+                st.markdown(f"**Reason:** {error_msg or 'Validation threshold of 50.0% null IDs exceeded.'}")
+                st.markdown("**Threshold Limit:** Null ID rate ≥ 50.0%")
+                st.markdown("**Recommended Action:** The input file has been rejected. Inspect the source dataset file and ensure that the IDs are formatted correctly (i.e. integers or valid numeric representations). Check for malformed strings.")
+            elif failed_records > 0:
+                st.warning("⚠️ Data Quality Warning")
+                st.markdown(f"**Reason:** Data contains {failed_records} anomalous records ({null_ids} Null/Malformed IDs, {invalid_ages} Invalid Ages, and {duplicate_ids} Duplicate IDs).")
+                st.markdown("**Recommended Action:** The pipeline completed successfully by automatically cleansing and resolving these anomalies (Silver layer). However, verify upstream systems to improve source data completeness.")
+            else:
+                st.success("🟢 Data Quality Healthy")
+                st.markdown("**Reason:** 100% of processed records successfully conformed to data quality standards.")
+                st.markdown("**Audit Details:** 0 nulls, 0 invalid ages, and 0 duplicate IDs detected in the active ingestion batch.")
+
+    # ----------------- SECTION 2: LINEAGE FLOW VIEW -----------------
+    st.divider()
+    st.subheader("🔗 Data Lineage View")
+    with st.container(border=True):
+        lin_file, lin_arr1, lin_bronze, lin_arr2, lin_val, lin_arr3, lin_silver, lin_arr4, lin_gold = st.columns([2, 1, 2, 1, 2, 1, 2, 1, 2])
+        
+        with lin_file:
+            st.metric("1. Input File", last_file[:15] if last_file else "None")
+            st.caption("Landing Zone")
+            
+        with lin_arr1:
+            st.markdown("<h3 style='text-align: center; margin-top: 15px;'>➔</h3>", unsafe_allow_html=True)
+            
+        with lin_bronze:
+            st.metric("2. Bronze (Raw)", f"{bronze_cnt:,}")
+            st.caption("Raw schemas (StringType)")
+            
+        with lin_arr2:
+            st.markdown("<h3 style='text-align: center; margin-top: 15px;'>➔</h3>", unsafe_allow_html=True)
+            
+        with lin_val:
+            val_status = "Passed ✅" if failed_records / max(1, total_validated) < 0.5 else "Failed ❌"
+            st.metric("3. Validation", val_status)
+            st.caption(f"{failed_records} violations flagged")
+            
+        with lin_arr3:
+            st.markdown("<h3 style='text-align: center; margin-top: 15px;'>➔</h3>", unsafe_allow_html=True)
+            
+        with lin_silver:
+            st.metric("4. Silver (Cleaned)", f"{silver_cnt:,}")
+            st.caption(f"{failed_records} rows rejected")
+            
+        with lin_arr4:
+            st.markdown("<h3 style='text-align: center; margin-top: 15px;'>➔</h3>", unsafe_allow_html=True)
+            
+        with lin_gold:
+            st.metric("5. Gold (Curated)", f"{gold_cnt:,}")
+            st.caption("Aggregation complete")
+
+    # ----------------- SECTION 3: DATA QUALITY DASHBOARD (KPI CARDS) -----------------
+    st.divider()
+    st.subheader("🎯 Data Quality Scorecard")
+    with st.container(border=True):
+        kpi_score, kpi_null, kpi_dupe, kpi_age, kpi_pass, kpi_fail = st.columns(6)
+        kpi_score.metric("Overall DQ Score", f"{dq_score:.2f}%")
+        kpi_null.metric("Null ID Rate", f"{null_rate:.2f}%")
+        kpi_dupe.metric("Duplicate ID Rate", f"{dup_rate:.2f}%")
+        kpi_age.metric("Invalid Age Rate", f"{inv_age_rate:.2f}%")
+        kpi_pass.metric("Records Passed", f"{passed_records:,}")
+        kpi_fail.metric("Records Failed", f"{failed_records:,}")
+
+    # ----------------- SECTION 4: DQ AUDIT PANEL -----------------
+    st.divider()
+    st.subheader("🔍 Data Quality Audit Panel")
+    
+    audit_details = get_dq_audit_details(spark)
+    col_audit_ids, col_audit_ages, col_audit_dupes = st.columns(3)
+    
+    with col_audit_ids:
+        with st.container(border=True):
+            st.markdown(f"##### 🔤 Malformed IDs ({audit_details['malformed_ids']['count']})")
+            if audit_details['malformed_ids']['samples']:
+                st.dataframe(pd.DataFrame(audit_details['malformed_ids']['samples']), hide_index=True, use_container_width=True)
+            else:
+                st.success("No malformed IDs found in active raw data.")
+                
+    with col_audit_ages:
+        with st.container(border=True):
+            st.markdown(f"##### 🔢 Malformed Ages ({audit_details['malformed_ages']['count']})")
+            if audit_details['malformed_ages']['samples']:
+                st.dataframe(pd.DataFrame(audit_details['malformed_ages']['samples']), hide_index=True, use_container_width=True)
+            else:
+                st.success("No malformed ages found in active raw data.")
+                
+    with col_audit_dupes:
+        with st.container(border=True):
+            st.markdown(f"##### 👥 Duplicate Keys ({audit_details['duplicate_ids']['count']})")
+            if audit_details['duplicate_ids']['samples']:
+                st.dataframe(pd.DataFrame(audit_details['duplicate_ids']['samples']), hide_index=True, use_container_width=True)
+            else:
+                st.success("No duplicate keys found in active raw data.")
+
+    # ----------------- SECTION 5: DQ TREND ANALYSIS & LAYER STATISTICS -----------------
+    st.divider()
+    col_trend, col_lineage_funnel = st.columns([3, 2])
+    
+    with col_trend:
+        with st.container(border=True):
+            dq_trend_df = get_dq_trends(spark)
+            fig_trends = plot_dq_trends(dq_trend_df)
+            if fig_trends:
+                st.plotly_chart(fig_trends, use_container_width=True)
+            else:
+                st.info("Insufficient DQ history to compile trends chart.")
+                
+    with col_lineage_funnel:
         with st.container(border=True):
             st.plotly_chart(plot_data_funnel(bronze_cnt, silver_cnt, gold_cnt), use_container_width=True)
-        
-    with col_history:
-        try:
-            dt_silver = DeltaTable.forPath(spark, SILVER_PATH)
-            history_df = dt_silver.history().select("timestamp", "operationMetrics").toPandas()
+
+    # ----------------- SECTION 6: PIPELINE RUN REPORT -----------------
+    st.divider()
+    st.subheader("📋 Pipeline Run Report")
+    
+    if history_records:
+        history_table_data = []
+        for r in history_records:
+            t_str = datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+            status_text = "🟢 Completed" if r.get("status") == "completed" else "🔴 Failed"
             
-            file_data = []
-            for _, row in history_df.iterrows():
-                metrics = row["operationMetrics"] if row["operationMetrics"] else {}
-                output_rows = metrics.get('numOutputRows', 0)
-                file_data.append({
-                    "Timestamp": row["timestamp"].strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(row["timestamp"]) else "",
-                    "Cleaned Rows Written": int(output_rows) if output_rows else 0
-                })
+            rows_val = r.get("rows", 0)
+            rows_str = f"{rows_val:,}" if (rows_val is not None and isinstance(rows_val, (int, float))) else "0"
             
-            df_hist = pd.DataFrame(file_data)
-            fig = plot_pipeline_history(df_hist)
-            with st.container(border=True):
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+            dur_val = r.get("duration", "N/A")
+            if isinstance(dur_val, (int, float)):
+                dur_str = f"{dur_val:.2f}s"
+            else:
+                dur_str = str(dur_val)
+                if dur_str.replace('.', '', 1).isdigit():
+                    dur_str = f"{float(dur_str):.2f}s"
                 else:
-                    st.info("No volume history available.")
-        except Exception:
-            st.info("Volume history unavailable.")
+                    dur_str = "N/A"
+                    
+            history_table_data.append({
+                "Run ID": r.get("run_id") or "N/A",
+                "Timestamp": t_str,
+                "File Name": r.get("file_name") or "Unknown",
+                "Status": status_text,
+                "Duration": dur_str,
+                "Cleaned Rows Processed": rows_str,
+                "Error Details": r.get("error") or "None"
+            })
+        st.dataframe(pd.DataFrame(history_table_data), use_container_width=True, hide_index=True)
+    else:
+        st.info("No runs logged yet.")
 
 # ----------------- AUTO-REFRESH TRIGGER -----------------
 if status == "Pipeline running":

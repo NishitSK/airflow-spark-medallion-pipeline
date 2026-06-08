@@ -20,14 +20,14 @@ def transform_silver(spark=None):
         bronze_df = read_delta(spark, BRONZE_PATH)
         
         # Normalize whole numbers written as floats (e.g. 1001.0 or 1001.000 -> 1001)
-        cleaned_id = regexp_replace(col("id"), r"\.0+$", "")
-        cleaned_age = regexp_replace(col("age"), r"\.0+$", "")
+        cleaned_id = regexp_replace(trim(col("id")), r"\.0+$", "")
+        cleaned_age = regexp_replace(trim(col("age")), r"\.0+$", "")
         
         # Cast to IntegerType
         id_int = cleaned_id.cast("int")
         age_int = cleaned_age.cast("int")
         
-        # Defensive validation: Count and log integer conversion failures
+        # Defensive validation: Count and log integer conversion failures for ID
         malformed_ids = bronze_df.filter(
             col("id").isNotNull() & (trim(col("id")) != "") & id_int.isNull()
         )
@@ -35,7 +35,17 @@ def transform_silver(spark=None):
         if malformed_count > 0:
             print(f"WARNING: {malformed_count} records had malformed IDs that failed conversion to integers.")
             sample_failures = malformed_ids.select("id", "name").limit(5).collect()
-            print("Sample malformed IDs: " + ", ".join([f"'{r['id']}' ({r['name']})" for r in sample_failures]))
+            print("Sample malformed IDs in Silver: " + ", ".join([f"'{r['id']}' ({r['name']})" for r in sample_failures]))
+
+        # Defensive validation: Count and log integer conversion failures for age
+        malformed_ages = bronze_df.filter(
+            col("age").isNotNull() & (trim(col("age")) != "") & age_int.isNull()
+        )
+        malformed_age_count = malformed_ages.count()
+        if malformed_age_count > 0:
+            print(f"WARNING: {malformed_age_count} records had malformed ages that failed conversion to integers.")
+            sample_age_failures = malformed_ages.select("age", "name").limit(5).collect()
+            print("Sample malformed ages in Silver: " + ", ".join([f"'{r['age']}' ({r['name']})" for r in sample_age_failures]))
 
         # Transform and cast raw fields to clean Silver schema
         transformed_df = bronze_df.withColumn("id", id_int) \
