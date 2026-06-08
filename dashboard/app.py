@@ -156,97 +156,7 @@ elif run_status_text == "QUEUED":
 elif run_status_text == "FAILED":
     status_indicator = "🔴 Pipeline Failed"
 
-# ----------------- TOP METRIC SECTION -----------------
-with st.container(border=True):
-    col_status, col_file, col_time, col_dur, col_rows = st.columns(5)
-    with col_status:
-        st.metric(label="Pipeline Status", value=status_indicator)
-    with col_file:
-        st.metric(label="Last Processed File", value=last_file[:25] if last_file else "None")
-    with col_time:
-        st.metric(label="Last Successful Run", value=last_success if last_success != "N/A" else "N/A")
-    with col_dur:
-        dur_val = f"{duration:.2f}s" if isinstance(duration, (int, float)) else (f"{float(duration):.2f}s" if (duration != "N/A" and duration is not None and str(duration).replace('.', '', 1).isdigit()) else "N/A")
-        st.metric(label="Processing Duration", value=dur_val)
-    with col_rows:
-        st.metric(label="Records Processed", value=f"{latest_run_rows:,}" if (latest_run_rows is not None and isinstance(latest_run_rows, (int, float))) else "0")
 
-# ----------------- LAST RUN SUMMARY CARD -----------------
-try:
-    from queries import get_last_run_summary
-    summary_data = get_last_run_summary(spark)
-    st.subheader("📋 Last Run Summary")
-    with st.container(border=True):
-        col_s_status, col_s_start, col_s_end, col_s_dur, col_s_rows, col_s_dq = st.columns(6)
-        with col_s_status:
-            st.metric("Last Status", summary_data["status"])
-        with col_s_start:
-            st.metric("Start Time", summary_data["start_time"])
-        with col_s_end:
-            st.metric("End Time", summary_data["end_time"])
-        with col_s_dur:
-            st.metric("Duration", summary_data["duration"])
-        with col_s_rows:
-            st.metric("Rows Processed", summary_data["rows"])
-        with col_s_dq:
-            st.metric("DQ Score", summary_data["dq_score"])
-except Exception as e:
-    print(f"Error rendering Last Run Summary: {e}")
-
-# ----------------- LIVE PROCESSING PROGRESS -----------------
-if status == "Pipeline running":
-    st.divider()
-    st.info("🟢 **Live Monitoring**\nRefreshing every 3 seconds")
-    st.markdown("### 🔄 Pipeline Running...")
-    
-
-    
-    # Map raw stage to standard pipeline steps: Queued -> Bronze -> Silver -> Gold -> Completed
-    current_stage = "Queued"
-    if "queued" in status_src.lower():
-        current_stage = "Queued"
-    elif stage == "Waiting" or not stage:
-        current_stage = "Queued"
-    elif stage in ["Bronze", "Validation"]:
-        current_stage = "Bronze"
-    elif stage == "Silver":
-        current_stage = "Silver"
-    elif stage == "Gold":
-        current_stage = "Gold"
-    elif stage in ["Finished", "Completed"]:
-        current_stage = "Completed"
-    else:
-        current_stage = "Queued"
-
-    stage_pcts = {
-        "Queued": 20,
-        "Bronze": 40,
-        "Silver": 60,
-        "Gold": 80,
-        "Completed": 100
-    }
-    pct = stage_pcts.get(current_stage, 20)
-    st.progress(pct)
-    
-    with st.status(f"Pipeline Processing (Active Stage: {current_stage})", expanded=True) as status_container:
-        q_icon = "🟢 Completed" if current_stage in ["Bronze", "Silver", "Gold", "Completed"] else "🟡 Running"
-        st.markdown(f"**{q_icon}: Queued**")
-        st.write("↓")
-        
-        b_icon = "🟢 Completed" if current_stage in ["Silver", "Gold", "Completed"] else ("🟡 Running" if current_stage == "Bronze" else "⚪ Pending")
-        st.markdown(f"**{b_icon}: Bronze (Raw Ingest & Quality Rules)**")
-        st.write("↓")
-        
-        s_icon = "🟢 Completed" if current_stage in ["Gold", "Completed"] else ("🟡 Running" if current_stage == "Silver" else "⚪ Pending")
-        st.markdown(f"**{s_icon}: Silver (Transform & Cleanse)**")
-        st.write("↓")
-        
-        g_icon = "🟢 Completed" if current_stage == "Completed" else ("🟡 Running" if current_stage == "Gold" else "⚪ Pending")
-        st.markdown(f"**{g_icon}: Gold (KPI Aggregations)**")
-        st.write("↓")
-        
-        c_icon = "🟢 Completed" if current_stage == "Completed" else "⚪ Pending"
-        st.markdown(f"**{c_icon}: Completed**")
 
 # ----------------- ERROR HANDLING PANEL -----------------
 def get_user_friendly_error(err):
@@ -273,15 +183,11 @@ def get_user_friendly_error(err):
         "Check that the input format matches the expected columns (id, name, age) and that Spark cluster memory is healthy."
     )
 
-if status == "Pipeline failed" and error_msg:
-    reason, fix = get_user_friendly_error(error_msg)
-    with st.container(border=True):
-        st.error("❌ Pipeline Failed")
-        st.markdown(f"**Reason:**\n{reason}")
-        st.markdown(f"**Suggested Fix:**\n{fix}")
+# Failure UI logic moved inside page scope.
 
 # ----------------- RENDER NAVIGATION PAGES -----------------
 if page == "Pipeline Dashboard":
+    st.title("📊 Self-Service Medallion Data Platform")
     st.divider()
     
     def clear_input_folder():
@@ -550,6 +456,95 @@ if page == "Pipeline Dashboard":
                                 st.error(f"Failed to trigger: {msg}")
                     else:
                         st.error("Airflow connection is disabled. Enable it in settings.")
+
+    # ----------------- LIVE PROCESSING PROGRESS -----------------
+    if status == "Pipeline running":
+        st.divider()
+        st.info("🟢 **Live Monitoring**\nRefreshing every 3 seconds")
+        st.markdown("### 🔄 Pipeline Running...")
+        
+        # Map raw stage to standard pipeline steps: Queued -> Bronze -> Silver -> Gold -> Completed
+        current_stage = "Queued"
+        if "queued" in status_src.lower():
+            current_stage = "Queued"
+        elif stage == "Waiting" or not stage:
+            current_stage = "Queued"
+        elif stage in ["Bronze", "Validation"]:
+            current_stage = "Bronze"
+        elif stage == "Silver":
+            current_stage = "Silver"
+        elif stage == "Gold":
+            current_stage = "Gold"
+        elif stage in ["Finished", "Completed"]:
+            current_stage = "Completed"
+        else:
+            current_stage = "Queued"
+        with st.status(f"Pipeline Processing (Active Stage: {current_stage})", expanded=True) as status_container:
+            q_icon = "🟢 Completed" if current_stage in ["Bronze", "Silver", "Gold", "Completed"] else "🟡 Running"
+            st.markdown(f"**{q_icon}: Queued**")
+            st.write("↓")
+            
+            b_icon = "🟢 Completed" if current_stage in ["Silver", "Gold", "Completed"] else ("🟡 Running" if current_stage == "Bronze" else "⚪ Pending")
+            st.markdown(f"**{b_icon}: Bronze (Raw Ingest & Quality Rules)**")
+            st.write("↓")
+            
+            s_icon = "🟢 Completed" if current_stage in ["Gold", "Completed"] else ("🟡 Running" if current_stage == "Silver" else "⚪ Pending")
+            st.markdown(f"**{s_icon}: Silver (Transform & Cleanse)**")
+            st.write("↓")
+            
+            g_icon = "🟢 Completed" if current_stage == "Completed" else ("🟡 Running" if current_stage == "Gold" else "⚪ Pending")
+            st.markdown(f"**{g_icon}: Gold (KPI Aggregations)**")
+            st.write("↓")
+            
+            c_icon = "🟢 Completed" if current_stage == "Completed" else "⚪ Pending"
+            st.markdown(f"**{c_icon}: Completed**")
+
+    # ----------------- ERROR HANDLING PANEL -----------------
+    if status == "Pipeline failed" and error_msg:
+        reason, fix = get_user_friendly_error(error_msg)
+        with st.container(border=True):
+            st.error("❌ Pipeline Failed")
+            st.markdown(f"**Reason:**\n{reason}")
+            st.markdown(f"**Suggested Fix:**\n{fix}")
+
+    # ----------------- PIPELINE STATUS METRICS -----------------
+    st.divider()
+    st.subheader("📊 Pipeline Status Metrics")
+    with st.container(border=True):
+        col_status, col_file, col_time, col_dur, col_rows = st.columns(5)
+        with col_status:
+            st.metric(label="Pipeline Status", value=status_indicator)
+        with col_file:
+            st.metric(label="Last Processed File", value=last_file[:25] if last_file else "None")
+        with col_time:
+            st.metric(label="Last Successful Run", value=last_success if last_success != "N/A" else "N/A")
+        with col_dur:
+            dur_val = f"{duration:.2f}s" if isinstance(duration, (int, float)) else (f"{float(duration):.2f}s" if (duration != "N/A" and duration is not None and str(duration).replace('.', '', 1).isdigit()) else "N/A")
+            st.metric(label="Processing Duration", value=dur_val)
+        with col_rows:
+            st.metric(label="Records Processed", value=f"{latest_run_rows:,}" if (latest_run_rows is not None and isinstance(latest_run_rows, (int, float))) else "0")
+
+    # ----------------- LAST RUN SUMMARY CARD -----------------
+    try:
+        from queries import get_last_run_summary
+        summary_data = get_last_run_summary(spark)
+        st.subheader("📋 Last Run Summary")
+        with st.container(border=True):
+            col_s_status, col_s_start, col_s_end, col_s_dur, col_s_rows, col_s_dq = st.columns(6)
+            with col_s_status:
+                st.metric("Last Status", summary_data["status"])
+            with col_s_start:
+                st.metric("Start Time", summary_data["start_time"])
+            with col_s_end:
+                st.metric("End Time", summary_data["end_time"])
+            with col_s_dur:
+                st.metric("Duration", summary_data["duration"])
+            with col_s_rows:
+                st.metric("Rows Processed", summary_data["rows"])
+            with col_s_dq:
+                st.metric("DQ Score", summary_data["dq_score"])
+    except Exception as e:
+        print(f"Error rendering Last Run Summary: {e}")
 
     # System Health Panel & Dataset Information
     st.divider()
