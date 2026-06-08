@@ -199,39 +199,7 @@ if status == "Pipeline running":
     st.info("🟢 **Live Monitoring**\nRefreshing every 3 seconds")
     st.markdown("### 🔄 Pipeline Running...")
     
-    # ----------------- RUN TIMELINE VISUALIZATION -----------------
-    t_queued = "⚪ Queued"
-    t_running = "⚪ Running"
-    t_final = "⚪ Success / Failed"
-    
-    if run_status_text == "QUEUED":
-        t_queued = "🔵 Queued (Active)"
-    elif run_status_text == "RUNNING":
-        t_queued = "🟢 Queued"
-        t_running = "🟡 Running (Active)"
-    elif run_status_text == "SUCCESS":
-        t_queued = "🟢 Queued"
-        t_running = "🟢 Running"
-        t_final = "🟢 Success"
-    elif run_status_text == "FAILED":
-        t_queued = "🟢 Queued"
-        t_running = "🟢 Running"
-        t_final = "🔴 Failed"
-        
-    st.markdown(f"""
-    **Run Timeline:**
-    
-    {t_queued}
-    
-    **↓**
-    
-    {t_running}
-    
-    **↓**
-    
-    {t_final}
-    """)
-    st.divider()
+
     
     # Map raw stage to standard pipeline steps: Queued -> Bronze -> Silver -> Gold -> Completed
     current_stage = "Queued"
