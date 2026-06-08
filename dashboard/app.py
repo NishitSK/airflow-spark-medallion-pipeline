@@ -428,6 +428,23 @@ if page == "Pipeline Dashboard":
     st.divider()
     st.subheader("🚀 Pipeline Execution Panel")
     with st.container(border=True):
+        # Load local status details if available
+        local_status = None
+        local_stage = "Waiting"
+        local_duration = "N/A"
+        local_run_id = "N/A"
+        if os.path.exists(STATUS_FILE):
+            try:
+                import json
+                with open(STATUS_FILE, "r") as f:
+                    state_data = json.load(f)
+                    local_status = state_data.get("status")
+                    local_stage = state_data.get("stage", "Waiting")
+                    local_duration = state_data.get("duration") or "N/A"
+                    local_run_id = state_data.get("run_id") or "N/A"
+            except:
+                pass
+
         # Retrieve latest execution details and runs status counts
         run_details = None
         queued_cnt = 0
@@ -495,7 +512,8 @@ if page == "Pipeline Dashboard":
                 st.markdown(f"**End Time:** `{run_details.get('end_time')}`")
                 st.markdown(f"**Duration:** `{run_details.get('duration')}`")
             elif local_status:
-                st.markdown(f"**DAG Run ID:** `{local_stage}`")
+                st.markdown(f"**DAG Run ID:** `{local_run_id}`")
+                st.markdown(f"**Active Stage:** `{local_stage}`")
                 st.markdown(f"**Start Time:** `N/A`")
                 st.markdown(f"**End Time:** `N/A`")
                 st.markdown(f"**Duration:** `{local_duration}`")
