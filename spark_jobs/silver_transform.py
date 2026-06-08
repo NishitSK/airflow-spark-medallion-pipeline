@@ -1,6 +1,6 @@
 import sys
 import os
-from pyspark.sql.functions import to_date, col
+from pyspark.sql.functions import to_date, col, regexp_replace, trim
 from pipeline.config import BRONZE_PATH, SILVER_PATH, SPARK_LOG_LEVEL
 from pipeline.delta_utils import get_spark_session, read_delta, write_delta
 
@@ -19,8 +19,30 @@ def transform_silver(spark=None):
 
         bronze_df = read_delta(spark, BRONZE_PATH)
         
-        # Deduplicate batch
-        new_batch = bronze_df.dropDuplicates(["id"])
+        # Normalize whole numbers written as floats (e.g. 1001.0 or 1001.000 -> 1001)
+        cleaned_id = regexp_replace(col("id"), r"\.0+$", "")
+        cleaned_age = regexp_replace(col("age"), r"\.0+$", "")
+        
+        # Cast to IntegerType
+        id_int = cleaned_id.cast("int")
+        age_int = cleaned_age.cast("int")
+        
+        # Defensive validation: Count and log integer conversion failures
+        malformed_ids = bronze_df.filter(
+            col("id").isNotNull() & (trim(col("id")) != "") & id_int.isNull()
+        )
+        malformed_count = malformed_ids.count()
+        if malformed_count > 0:
+            print(f"WARNING: {malformed_count} records had malformed IDs that failed conversion to integers.")
+            sample_failures = malformed_ids.select("id", "name").limit(5).collect()
+            print("Sample malformed IDs: " + ", ".join([f"'{r['id']}' ({r['name']})" for r in sample_failures]))
+
+        # Transform and cast raw fields to clean Silver schema
+        transformed_df = bronze_df.withColumn("id", id_int) \
+                                   .withColumn("age", age_int)
+        
+        # Deduplicate batch on the normalized integer ID
+        new_batch = transformed_df.dropDuplicates(["id"])
         
         final_df = new_batch.withColumn("processed_date", to_date("ingestion_time")) \
                             .fillna({"age": 45})

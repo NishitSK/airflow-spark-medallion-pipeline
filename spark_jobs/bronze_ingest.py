@@ -13,9 +13,9 @@ def ingest_bronze(spark=None):
     spark.sparkContext.setLogLevel(SPARK_LOG_LEVEL)
 
     schema = StructType([
-        StructField("id", IntegerType(), True),
+        StructField("id", StringType(), True),
         StructField("name", StringType(), True),
-        StructField("age", IntegerType(), True)
+        StructField("age", StringType(), True)
     ])
 
     try:

@@ -1,5 +1,4 @@
-import sys
-from pyspark.sql.functions import col, count, when, sum as _sum
+from pyspark.sql.functions import col, count, when, sum as _sum, trim, regexp_replace
 from pipeline.config import BRONZE_PATH, DQ_METRICS_PATH, SPARK_LOG_LEVEL
 from pipeline.delta_utils import get_spark_session, read_delta, write_delta
 
@@ -28,11 +27,21 @@ def validate_data(spark=None):
             print("Validation: No data found in Bronze.")
             return True
 
-        # DQ Checks
+        # DQ Checks on raw String fields
+        # Clean float formats (e.g. 1001.0 -> 1001) for numeric checks
+        cleaned_id = regexp_replace(col("id"), r"\.0+$", "")
+        parsed_id = cleaned_id.cast("int")
+        
+        cleaned_age = regexp_replace(col("age"), r"\.0+$", "")
+        parsed_age = cleaned_age.cast("int")
+
+        # Determine invalid age: out of bounds, or non-numeric (fails to cast to int when not empty)
+        is_invalid_age = (parsed_age > 120) | (parsed_age.isNull() & col("age").isNotNull() & (trim(col("age")) != ""))
+
         dq_results = df.select(
-            _sum(when(col("id").isNull(), 1).otherwise(0)).alias("null_ids"),
-            _sum(when(col("age") < 0, 1).otherwise(0)).alias("negative_ages"),
-            _sum(when(col("age") > 120, 1).otherwise(0)).alias("invalid_ages")
+            _sum(when(col("id").isNull() | (trim(col("id")) == ""), 1).otherwise(0)).alias("null_ids"),
+            _sum(when(parsed_age < 0, 1).otherwise(0)).alias("negative_ages"),
+            _sum(when(is_invalid_age, 1).otherwise(0)).alias("invalid_ages")
         ).collect()[0]
 
         # Duplicate check
