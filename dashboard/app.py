@@ -74,9 +74,33 @@ if "use_airflow_api" not in st.session_state:
 if "airflow_api_url" not in st.session_state:
     st.session_state.airflow_api_url = "http://airflow:8080"
 if "airflow_username" not in st.session_state:
-    st.session_state.airflow_username = "admin"
+    st.session_state.airflow_username = os.environ.get("AIRFLOW_ADMIN_USER", "admin")
 if "airflow_password" not in st.session_state:
-    st.session_state.airflow_password = "admin"
+    st.session_state.airflow_password = os.environ.get("AIRFLOW_ADMIN_PASSWORD", "admin123")
+
+# Startup connection validation state
+if "connection_verified" not in st.session_state:
+    st.session_state.connection_verified = None
+if "connection_error" not in st.session_state:
+    st.session_state.connection_error = None
+
+def reset_connection_status():
+    st.session_state.connection_verified = None
+    st.session_state.connection_error = None
+
+if st.session_state.use_airflow_api and st.session_state.connection_verified is None:
+    try:
+        from airflow_client import run_connection_diagnostics
+        success, results = run_connection_diagnostics(
+            st.session_state.airflow_api_url,
+            st.session_state.airflow_username,
+            st.session_state.airflow_password
+        )
+        st.session_state.connection_verified = success
+        st.session_state.connection_error = results.get("error_message") if not success else None
+    except Exception as e:
+        st.session_state.connection_verified = False
+        st.session_state.connection_error = f"Diagnostics error: {str(e)}"
 
 # Sidebar Design
 with st.sidebar:
@@ -92,22 +116,41 @@ with st.sidebar:
     
     st.divider()
     with st.expander("⚙️ Connection Settings"):
-        st.session_state.use_airflow_api = st.checkbox("Enable Orchestrator Sync", value=st.session_state.use_airflow_api)
-        st.session_state.airflow_api_url = st.text_input("Scheduler API URL", value=st.session_state.airflow_api_url)
-        st.session_state.airflow_username = st.text_input("API Username", value=st.session_state.airflow_username)
-        st.session_state.airflow_password = st.text_input("API Password", value=st.session_state.airflow_password, type="password")
+        st.session_state.use_airflow_api = st.checkbox("Enable Orchestrator Sync", value=st.session_state.use_airflow_api, on_change=reset_connection_status)
+        st.session_state.airflow_api_url = st.text_input("Scheduler API URL", value=st.session_state.airflow_api_url, on_change=reset_connection_status)
+        st.session_state.airflow_username = st.text_input("API Username", value=st.session_state.airflow_username, on_change=reset_connection_status)
+        st.session_state.airflow_password = st.text_input("API Password", value=st.session_state.airflow_password, type="password", on_change=reset_connection_status)
         
         if st.button("🔌 Test Connection", use_container_width=True):
-            from airflow_client import test_airflow_connection
-            success, msg = test_airflow_connection(
+            from airflow_client import run_connection_diagnostics
+            success, results = run_connection_diagnostics(
                 st.session_state.airflow_api_url,
                 st.session_state.airflow_username,
                 st.session_state.airflow_password
             )
-            if success:
-                st.success("Successfully connected to the pipeline scheduler REST API.")
+            st.session_state.connection_verified = success
+            st.session_state.connection_error = results.get("error_message") if not success else None
+            
+            st.markdown("##### Connection Diagnostics")
+            if results["reachable"]:
+                st.success("✓ API reachable")
             else:
-                st.error("Failed to connect to the pipeline scheduler. Verify connection settings and logs.")
+                st.error("✗ API reachable")
+                
+            if results["reachable"]:
+                if results["authenticated"]:
+                    st.success("✓ Authentication successful")
+                else:
+                    st.error("✗ Authentication failed")
+                    
+            if results["reachable"] and results["authenticated"]:
+                if results["dag_found"]:
+                    st.success("✓ DAG found")
+                else:
+                    st.error(f"✗ DAG found: {results.get('error_message')}")
+                    
+            if not success and results.get("error_message"):
+                st.error(f"Error Details: {results['error_message']}")
 
     st.divider()
     st.caption("Production Build: v3.0")
@@ -411,10 +454,13 @@ if page == "Pipeline Dashboard":
                 except:
                     pass
             
-            run_btn_disabled = not has_input or (run_status_text in ["RUNNING", "QUEUED"])
+            conn_ok = st.session_state.connection_verified if st.session_state.use_airflow_api else True
+            run_btn_disabled = not has_input or (run_status_text in ["RUNNING", "QUEUED"]) or not conn_ok
             
             if not has_input:
                 st.caption("⚠️ Upload/load a file first")
+            elif not conn_ok:
+                st.caption(f"❌ Connection check failed: {st.session_state.connection_error or 'Verify settings and test connection'}")
             else:
                 st.caption(f"Staged: `{staged_filename[:20]}`")
                 

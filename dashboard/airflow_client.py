@@ -1,49 +1,96 @@
 import requests
 import base64
 import urllib3
+import os
 
 # Suppress insecure connection warnings if users use self-signed SSL certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def get_basic_auth_headers(username, password):
-    auth_str = f"{username}:{password}"
-    b64_auth = base64.b64encode(auth_str.encode()).decode()
-    return {
-        "Authorization": f"Basic {b64_auth}",
-        "Content-Type": "application/json"
-    }
+def get_airflow_token(api_url, username, password):
+    """
+    Retrieves a JWT token from the Airflow 3 token endpoint.
+    Caches it in st.session_state if Streamlit is running.
+    """
+    # Try to use streamlit session state caching if available
+    try:
+        import streamlit as st
+        cache_key = f"jwt_token_{api_url}_{username}"
+        if cache_key in st.session_state and st.session_state[cache_key]:
+            return st.session_state[cache_key], None
+    except ImportError:
+        st = None
+        cache_key = None
+
+    token_url = f"{api_url.rstrip('/')}/auth/token"
+    try:
+        response = requests.post(
+            token_url,
+            json={"username": username, "password": password},
+            headers={"Content-Type": "application/json"},
+            timeout=3,
+            verify=False
+        )
+        if response.status_code == 200:
+            token = response.json().get("access_token")
+            if token:
+                if st and cache_key:
+                    st.session_state[cache_key] = token
+                return token, None
+            return None, "Authentication succeeded, but no access token was returned."
+        elif response.status_code in [401, 403]:
+            return None, "Authentication failed: Invalid username or password."
+        else:
+            return None, f"Authentication failed (HTTP {response.status_code})."
+    except requests.exceptions.RequestException as e:
+        return None, f"Could not reach Airflow server at {api_url}. Check server status."
+
+def get_auth_headers(api_url, username, password):
+    """
+    Generates headers containing the JWT token.
+    """
+    token, err = get_airflow_token(api_url, username, password)
+    if token:
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }, None
+    return None, err
+
+def clear_cached_token(api_url, username):
+    """
+    Clears cached token from st.session_state to force re-authentication.
+    """
+    try:
+        import streamlit as st
+        cache_key = f"jwt_token_{api_url}_{username}"
+        if cache_key in st.session_state:
+            st.session_state[cache_key] = None
+    except ImportError:
+        pass
 
 def get_dag_runs(api_url="http://airflow:8080", username="admin", password="admin", dag_id="file_trigger_pipeline"):
     """
-    Fetches DAG runs from Airflow REST API. 
-    First tries Airflow 3.x endpoint (/api/v2) and falls back to Airflow 2.x (/api/v1).
+    Fetches DAG runs from Airflow REST API using JWT token.
     """
-    headers = get_basic_auth_headers(username, password)
-    
-    # Airflow 3.x endpoint
+    headers, error = get_auth_headers(api_url, username, password)
+    if error:
+        return None, error
+        
     v2_url = f"{api_url.rstrip('/')}/api/v2/dags/{dag_id}/dagRuns"
     try:
         response = requests.get(v2_url, headers=headers, timeout=3, verify=False)
+        # If unauthorized, clear token cache and retry once
+        if response.status_code in [401, 403]:
+            clear_cached_token(api_url, username)
+            headers, error = get_auth_headers(api_url, username, password)
+            if not error:
+                response = requests.get(v2_url, headers=headers, timeout=3, verify=False)
+                
         if response.status_code == 200:
             return response.json().get("dag_runs", []), None
-        elif response.status_code == 404:
-            # Maybe it is Airflow 2.x, try v1
-            v1_url = f"{api_url.rstrip('/')}/api/v1/dags/{dag_id}/dagRuns"
-            response = requests.get(v1_url, headers=headers, timeout=3, verify=False)
-            if response.status_code == 200:
-                return response.json().get("dag_runs", []), None
-            return None, f"Airflow API check failed (HTTP {response.status_code})."
         else:
             return None, f"Airflow API check failed (HTTP {response.status_code})."
     except requests.exceptions.RequestException:
-        # Fallback to local v1 check or connection failure report
-        try:
-            v1_url = f"{api_url.rstrip('/')}/api/v1/dags/{dag_id}/dagRuns"
-            response = requests.get(v1_url, headers=headers, timeout=2, verify=False)
-            if response.status_code == 200:
-                return response.json().get("dag_runs", []), None
-        except:
-            pass
         return None, "Connection failed. Please check if the Airflow server is running and reachable."
 
 def check_latest_dag_status(api_url="http://airflow:8080", username="admin", password="admin", dag_id="file_trigger_pipeline"):
@@ -66,46 +113,96 @@ def check_latest_dag_status(api_url="http://airflow:8080", username="admin", pas
     except Exception:
         return None, "Failed to parse Airflow API response."
 
+def run_connection_diagnostics(api_url, username, password, dag_id="file_trigger_pipeline"):
+    """
+    Runs comprehensive connection diagnostics for Airflow API.
+    Returns (success, results) where results is a dictionary of status flags.
+    """
+    results = {
+        "reachable": False,
+        "authenticated": False,
+        "dag_found": False,
+        "error_message": None
+    }
+    
+    # 1. Test Reachability via health endpoint
+    health_url = f"{api_url.rstrip('/')}/api/v2/monitor/health"
+    try:
+        requests.get(health_url, timeout=3, verify=False)
+        results["reachable"] = True
+    except requests.exceptions.RequestException:
+        # Check base URL
+        try:
+            requests.get(api_url, timeout=2, verify=False)
+            results["reachable"] = True
+        except requests.exceptions.RequestException:
+            results["error_message"] = "Airflow server is completely unreachable. Check the URL and docker state."
+            return False, results
+
+    # 2. Test Token Authentication
+    # Clear cache first to test fresh credentials
+    clear_cached_token(api_url, username)
+    token, err = get_airflow_token(api_url, username, password)
+    if not token:
+        results["error_message"] = err or "Authentication failed."
+        return False, results
+        
+    results["authenticated"] = True
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    # 3. Test DAG Presence
+    specific_dag_url = f"{api_url.rstrip('/')}/api/v2/dags/{dag_id}"
+    try:
+        dag_resp = requests.get(specific_dag_url, headers=headers, timeout=3, verify=False)
+        if dag_resp.status_code == 200:
+            results["dag_found"] = True
+            is_paused = dag_resp.json().get("is_paused", False)
+            if is_paused:
+                results["error_message"] = f"DAG '{dag_id}' is found but paused. Please unpause it."
+        elif dag_resp.status_code == 404:
+            results["error_message"] = f"DAG '{dag_id}' not found on the Airflow server."
+            return False, results
+        else:
+            results["error_message"] = f"Failed to retrieve DAG (HTTP {dag_resp.status_code})."
+            return False, results
+    except requests.exceptions.RequestException as e:
+        results["error_message"] = f"Network error during DAG check: {str(e)}"
+        return False, results
+
+    return True, results
+
 def test_airflow_connection(api_url, username, password):
     """
-    Tests credentials and connection to Airflow server.
+    Tests credentials and connection to Airflow server (backward compatibility).
     """
-    headers = get_basic_auth_headers(username, password)
-    v2_url = f"{api_url.rstrip('/')}/api/v2/dags"
-    try:
-        response = requests.get(v2_url, headers=headers, timeout=3, verify=False)
-        if response.status_code == 200:
-            return True, "Successfully connected using Airflow 3.x API (v2)"
-        elif response.status_code == 404:
-            v1_url = f"{api_url.rstrip('/')}/api/v1/dags"
-            response = requests.get(v1_url, headers=headers, timeout=3, verify=False)
-            if response.status_code == 200:
-                return True, "Successfully connected using Airflow 2.x API (v1)"
-            return False, f"Connection failed (HTTP {response.status_code})."
-        elif response.status_code == 401:
-            return False, "Authentication failed. Please check your username and password."
-        else:
-            return False, f"Connection failed (HTTP {response.status_code})."
-    except requests.exceptions.RequestException:
-        return False, "Could not reach Airflow server. Check URL and network connection."
+    success, results = run_connection_diagnostics(api_url, username, password)
+    if success:
+        return True, "Successfully connected using Airflow 3.x API (v2)"
+    return False, results.get("error_message") or "Connection failed."
 
 def trigger_airflow_dag(api_url="http://airflow:8080", username="admin", password="admin", dag_id="file_trigger_pipeline"):
     """
     Triggers a run of the specified DAG via Airflow REST API.
-    Tries v2 (Airflow 3.x) and falls back to v1 (Airflow 2.x).
     """
-    headers = get_basic_auth_headers(username, password)
+    headers, error = get_auth_headers(api_url, username, password)
+    if error:
+        return False, error
+        
     v2_url = f"{api_url.rstrip('/')}/api/v2/dags/{dag_id}/dagRuns"
     try:
         response = requests.post(v2_url, headers=headers, json={}, timeout=3, verify=False)
+        # Handle expiration retry
+        if response.status_code in [401, 403]:
+            clear_cached_token(api_url, username)
+            headers, error = get_auth_headers(api_url, username, password)
+            if not error:
+                response = requests.post(v2_url, headers=headers, json={}, timeout=3, verify=False)
+                
         if response.status_code in [200, 201]:
             return True, "Pipeline triggered successfully."
-        elif response.status_code == 404:
-            v1_url = f"{api_url.rstrip('/')}/api/v1/dags/{dag_id}/dagRuns"
-            response = requests.post(v1_url, headers=headers, json={}, timeout=3, verify=False)
-            if response.status_code in [200, 201]:
-                return True, "Pipeline triggered successfully."
-            return False, f"Failed to trigger run (HTTP {response.status_code})."
         else:
             return False, f"Failed to trigger run (HTTP {response.status_code})."
     except requests.exceptions.RequestException:
@@ -158,49 +255,30 @@ def get_latest_run_details(api_url="http://airflow:8080", username="admin", pass
 def check_dag_safety(api_url="http://airflow:8080", username="admin", password="admin", dag_id="file_trigger_pipeline"):
     """
     Checks if the Airflow API is reachable, the DAG exists, and if it is paused.
-    Returns (is_safe, error_message)
     """
-    headers = get_basic_auth_headers(username, password)
-    
+    headers, error = get_auth_headers(api_url, username, password)
+    if error:
+        return False, error
+        
     v2_url = f"{api_url.rstrip('/')}/api/v2/dags/{dag_id}"
     try:
         response = requests.get(v2_url, headers=headers, timeout=3, verify=False)
+        # Handle retry on unauthorized
+        if response.status_code in [401, 403]:
+            clear_cached_token(api_url, username)
+            headers, error = get_auth_headers(api_url, username, password)
+            if not error:
+                response = requests.get(v2_url, headers=headers, timeout=3, verify=False)
+                
         if response.status_code == 200:
             data = response.json()
             is_paused = data.get("is_paused", False)
             if is_paused:
                 return False, f"DAG '{dag_id}' is paused. Please unpause it in the Airflow UI."
             return True, None
-        elif response.status_code == 401:
-            return False, "Authentication failed. Please verify your Scheduler API Username and Password in the Sidebar Connection Settings."
         elif response.status_code == 404:
-            v1_url = f"{api_url.rstrip('/')}/api/v1/dags/{dag_id}"
-            response = requests.get(v1_url, headers=headers, timeout=3, verify=False)
-            if response.status_code == 200:
-                data = response.json()
-                is_paused = data.get("is_paused", False)
-                if is_paused:
-                    return False, f"DAG '{dag_id}' is paused. Please unpause it in the Airflow UI."
-                return True, None
-            elif response.status_code == 401:
-                return False, "Authentication failed. Please verify your Scheduler API Username and Password in the Sidebar Connection Settings."
-            elif response.status_code == 404:
-                return False, f"DAG '{dag_id}' not found on the Airflow server."
-            return False, f"Airflow API check failed (HTTP {response.status_code})."
+            return False, f"DAG '{dag_id}' not found on the Airflow server."
         else:
             return False, f"Airflow API check failed (HTTP {response.status_code})."
     except requests.exceptions.RequestException:
-        try:
-            v1_url = f"{api_url.rstrip('/')}/api/v1/dags/{dag_id}"
-            response = requests.get(v1_url, headers=headers, timeout=2, verify=False)
-            if response.status_code == 200:
-                data = response.json()
-                is_paused = data.get("is_paused", False)
-                if is_paused:
-                    return False, f"DAG '{dag_id}' is paused. Please unpause it in the Airflow UI."
-                return True, None
-            elif response.status_code == 404:
-                return False, f"DAG '{dag_id}' not found on the Airflow server."
-        except:
-            pass
         return False, "Could not reach Airflow server. Check URL and network connection."
