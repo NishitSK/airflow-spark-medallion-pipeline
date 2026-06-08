@@ -1,6 +1,5 @@
 from airflow import DAG
 from airflow.providers.standard.operators.bash import BashOperator
-from airflow.providers.standard.sensors.filesystem import FileSensor
 from datetime import timedelta
 import pendulum
 import os
@@ -44,20 +43,10 @@ with DAG(
     dag_id="file_trigger_pipeline",
     default_args=default_args,
     description="Modular Medallion Pipeline",
-    schedule="* * * * *",   # run every minute
+    schedule=None,   # run only when explicitly triggered
     catchup=False,
     max_active_runs=1,
 ) as dag:
-
-    # Wait for file in input directory
-    wait_for_file = FileSensor(
-        task_id="wait_for_new_file",
-        filepath="/data/input",
-        fs_conn_id="fs_default",
-        poke_interval=5,
-        timeout=600,
-        mode="reschedule",
-    )
 
     # Run Spark unified medallion pipeline
     unified_pipeline = BashOperator(
@@ -65,13 +54,12 @@ with DAG(
         bash_command="python /opt/airflow/spark_jobs/unified_pipeline.py",
     )
 
-    # Archive processed CSV files
+    # Archive processed files on success
     archive_file = BashOperator(
         task_id="archive_file",
-        bash_command="mkdir -p /data/archive && mv /data/input/*.csv /data/input/*.json /data/archive/ 2>/dev/null || true",
-        trigger_rule="all_done",
+        bash_command="python /opt/airflow/monitoring/archive_file.py",
     )
 
     # Task order
-    wait_for_file >> unified_pipeline >> archive_file
+    unified_pipeline >> archive_file
 

@@ -41,6 +41,21 @@ from pipeline.config import (
     TRACE_PATH
 )
 
+def log_operation(event_type, message):
+    from pipeline.config import BASE_DATA_PATH
+    import os
+    from datetime import datetime
+    log_dir = os.path.join(BASE_DATA_PATH, "output")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "operations.log")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"[{timestamp}] [{event_type.upper()}] {message}\n"
+    try:
+        with open(log_file, "a") as f:
+            f.write(log_line)
+    except Exception as e:
+        print(f"Failed to write operations log: {str(e)}")
+
 st.set_page_config(
     page_title="Medallion Pipeline Dashboard",
     page_icon="📊",
@@ -121,12 +136,25 @@ b_runtime, b_total = get_kpis(spark)
 history_records = get_pipeline_history(spark)
 latest_run_rows = history_records[0].get("rows", 0) if history_records else 0
 
+# Retrieve the latest run state to determine the indicators
+run_status_text = "N/A"
+if api_url:
+    try:
+        from airflow_client import get_latest_run_details
+        details_ind, err_ind = get_latest_run_details(api_url, username, password)
+        if not err_ind and details_ind:
+            run_status_text = details_ind.get("state", "N/A").upper()
+    except:
+        pass
+
 # Convert status to display state
-status_indicator = "🟢 Healthy"
-if status == "Pipeline running":
-    status_indicator = "🟡 Running"
-elif status == "Pipeline failed":
-    status_indicator = "🔴 Failed"
+status_indicator = "🟢 Pipeline Ready"
+if run_status_text == "RUNNING":
+    status_indicator = "🟡 Pipeline Running"
+elif run_status_text == "QUEUED":
+    status_indicator = "🔵 Pipeline Queued"
+elif run_status_text == "FAILED":
+    status_indicator = "🔴 Pipeline Failed"
 
 # ----------------- TOP METRIC SECTION -----------------
 with st.container(border=True):
@@ -143,10 +171,67 @@ with st.container(border=True):
     with col_rows:
         st.metric(label="Records Processed", value=f"{latest_run_rows:,}" if (latest_run_rows is not None and isinstance(latest_run_rows, (int, float))) else "0")
 
+# ----------------- LAST RUN SUMMARY CARD -----------------
+try:
+    from queries import get_last_run_summary
+    summary_data = get_last_run_summary(spark)
+    st.subheader("📋 Last Run Summary")
+    with st.container(border=True):
+        col_s_status, col_s_start, col_s_end, col_s_dur, col_s_rows, col_s_dq = st.columns(6)
+        with col_s_status:
+            st.metric("Last Status", summary_data["status"])
+        with col_s_start:
+            st.metric("Start Time", summary_data["start_time"])
+        with col_s_end:
+            st.metric("End Time", summary_data["end_time"])
+        with col_s_dur:
+            st.metric("Duration", summary_data["duration"])
+        with col_s_rows:
+            st.metric("Rows Processed", summary_data["rows"])
+        with col_s_dq:
+            st.metric("DQ Score", summary_data["dq_score"])
+except Exception as e:
+    print(f"Error rendering Last Run Summary: {e}")
+
 # ----------------- LIVE PROCESSING PROGRESS -----------------
 if status == "Pipeline running":
     st.divider()
-    st.info("🟢 **Live Monitoring**\nRefreshing every 10 seconds")
+    st.info("🟢 **Live Monitoring**\nRefreshing every 3 seconds")
+    st.markdown("### 🔄 Pipeline Running...")
+    
+    # ----------------- RUN TIMELINE VISUALIZATION -----------------
+    t_queued = "⚪ Queued"
+    t_running = "⚪ Running"
+    t_final = "⚪ Success / Failed"
+    
+    if run_status_text == "QUEUED":
+        t_queued = "🔵 Queued (Active)"
+    elif run_status_text == "RUNNING":
+        t_queued = "🟢 Queued"
+        t_running = "🟡 Running (Active)"
+    elif run_status_text == "SUCCESS":
+        t_queued = "🟢 Queued"
+        t_running = "🟢 Running"
+        t_final = "🟢 Success"
+    elif run_status_text == "FAILED":
+        t_queued = "🟢 Queued"
+        t_running = "🟢 Running"
+        t_final = "🔴 Failed"
+        
+    st.markdown(f"""
+    **Run Timeline:**
+    
+    {t_queued}
+    
+    **↓**
+    
+    {t_running}
+    
+    **↓**
+    
+    {t_final}
+    """)
+    st.divider()
     
     # Map raw stage to standard pipeline steps: Queued -> Bronze -> Silver -> Gold -> Completed
     current_stage = "Queued"
@@ -231,6 +316,16 @@ if status == "Pipeline failed" and error_msg:
 if page == "Pipeline Dashboard":
     st.divider()
     
+    def clear_input_folder():
+        if os.path.exists(INPUT_PATH):
+            for f in os.listdir(INPUT_PATH):
+                fp = os.path.join(INPUT_PATH, f)
+                if os.path.isfile(fp) and f.endswith(('.csv', '.json')):
+                    try:
+                        os.remove(fp)
+                    except Exception as e:
+                        print(f"Error removing staged file {fp}: {e}")
+    
     # Ingestion Tabs in Main Body
     st.subheader("📥 Data Ingestion Control")
     tab_upload, tab_sample = st.tabs(["Upload Dataset", "Use Sample Dataset"])
@@ -267,24 +362,15 @@ if page == "Pipeline Dashboard":
                 st.info("Preview unavailable for this schema.")
                 
             if st.button("Process Dataset", type="primary", use_container_width=True):
+                # Clear old input files
+                clear_input_folder()
                 # Copy file from temp to final input folder
                 final_path = os.path.join(INPUT_PATH, uploaded_file.name)
                 shutil.move(temp_path, final_path)
                 st.session_state.last_uploaded_file = uploaded_file.name
                 
-                # Trigger pipeline
-                triggered = False
-                msg = ""
-                if api_url:
-                    from airflow_client import trigger_airflow_dag
-                    triggered, msg = trigger_airflow_dag(api_url, username, password)
-                    
-                if triggered:
-                    st.success(f"File uploaded and Pipeline Scheduler triggered successfully!")
-                else:
-                    st.info(f"File saved to input directory. Sync bypassed: {msg or 'API offline/disabled'}.")
-                
-                time.sleep(1)
+                st.success(f"File '{uploaded_file.name}' uploaded and staged successfully. Use the Pipeline Execution Panel below to run the pipeline.")
+                time.sleep(1.5)
                 st.rerun()
                 
     with tab_sample:
@@ -295,22 +381,15 @@ if page == "Pipeline Dashboard":
             src = os.path.join(SAMPLES_PATH, file)
             dest = os.path.join(INPUT_PATH, file)
             try:
+                # Clear old input files
+                clear_input_folder()
+                
                 os.makedirs(INPUT_PATH, exist_ok=True)
                 shutil.copy(src, dest)
                 st.session_state.last_uploaded_file = file
                 
-                triggered = False
-                msg = ""
-                if api_url:
-                    from airflow_client import trigger_airflow_dag
-                    triggered, msg = trigger_airflow_dag(api_url, username, password)
-                    
-                if triggered:
-                    st.toast(f"Loading {label} sample dataset...", icon="🚀")
-                else:
-                    st.toast(f"{label} dataset placed in input directory.", icon="📥")
-                    
-                time.sleep(1)
+                st.toast(f"{label} dataset staged in input directory.", icon="📥")
+                time.sleep(1.5)
                 st.rerun()
             except Exception as e:
                 st.error(f"Failed to load sample: {str(e)}")
@@ -344,6 +423,147 @@ if page == "Pipeline Dashboard":
                 st.write("**Processing Cost:** `$1.00 USD`")
                 st.divider()
                 st.button("Load Large CSV", type="secondary", use_container_width=True, on_click=run_sample, args=("Large CSV", "large_sample.csv"))
+
+    # ----------------- PIPELINE EXECUTION PANEL -----------------
+    st.divider()
+    st.subheader("🚀 Pipeline Execution Panel")
+    with st.container(border=True):
+        # Retrieve latest execution details and runs status counts
+        run_details = None
+        queued_cnt = 0
+        running_cnt = 0
+        success_cnt = 0
+        failed_cnt = 0
+        run_status_text = "N/A"
+        
+        if api_url:
+            from airflow_client import get_latest_run_details, get_dag_runs
+            details, err = get_latest_run_details(api_url, username, password)
+            if not err and details:
+                run_details = details
+                run_status_text = details.get("state", "N/A").upper()
+                
+            runs, err_runs = get_dag_runs(api_url, username, password)
+            if not err_runs and runs:
+                for run in runs:
+                    state_val = run.get("state")
+                    if state_val == "queued":
+                        queued_cnt += 1
+                    elif state_val == "running":
+                        running_cnt += 1
+                    elif state_val == "success":
+                        success_cnt += 1
+                    elif state_val == "failed":
+                        failed_cnt += 1
+        else:
+            # Fallback to local status
+            if local_status:
+                run_status_text = local_status.upper()
+                if local_status == "running":
+                    running_cnt = 1
+                elif local_status == "failed":
+                    failed_cnt = 1
+                elif local_status == "completed":
+                    success_cnt = 1
+                    
+        # Metrics layout
+        col_cur, col_q, col_r, col_s, col_f = st.columns(5)
+        with col_cur:
+            status_emoji = "🟢"
+            if run_status_text in ["RUNNING", "QUEUED"]:
+                status_emoji = "🟡"
+            elif run_status_text == "FAILED":
+                status_emoji = "🔴"
+            st.metric("Current Status", f"{status_emoji} {run_status_text}")
+        with col_q:
+            st.metric("Queued", queued_cnt)
+        with col_r:
+            st.metric("Running", running_cnt)
+        with col_s:
+            st.metric("Success", success_cnt)
+        with col_f:
+            st.metric("Failed", failed_cnt)
+            
+        st.divider()
+        
+        # Details & Trigger Columns
+        col_details, col_action = st.columns([3, 1])
+        with col_details:
+            if run_details:
+                st.markdown(f"**DAG Run ID:** `{run_details.get('run_id')}`")
+                st.markdown(f"**Start Time:** `{run_details.get('start_time')}`")
+                st.markdown(f"**End Time:** `{run_details.get('end_time')}`")
+                st.markdown(f"**Duration:** `{run_details.get('duration')}`")
+            elif local_status:
+                st.markdown(f"**DAG Run ID:** `{local_stage}`")
+                st.markdown(f"**Start Time:** `N/A`")
+                st.markdown(f"**End Time:** `N/A`")
+                st.markdown(f"**Duration:** `{local_duration}`")
+            else:
+                st.info("No run details available. Trigger a run to begin.")
+                
+        with col_action:
+            st.write("") # Spacer
+            st.write("")
+            
+            # Check if there is an input file staged (i.e. file exists in INPUT_PATH)
+            has_input = False
+            staged_filename = "None"
+            if os.path.exists(INPUT_PATH):
+                try:
+                    files = [f for f in os.listdir(INPUT_PATH) if f.endswith(('.csv', '.json'))]
+                    if files:
+                        has_input = True
+                        files.sort(key=lambda x: os.path.getmtime(os.path.join(INPUT_PATH, x)), reverse=True)
+                        staged_filename = files[0]
+                except:
+                    pass
+            
+            run_btn_disabled = not has_input or (run_status_text in ["RUNNING", "QUEUED"])
+            
+            if not has_input:
+                st.caption("⚠️ Upload/load a file first")
+            else:
+                st.caption(f"Staged: `{staged_filename[:20]}`")
+                
+            if run_status_text in ["RUNNING", "QUEUED"]:
+                st.warning("⚠️ Pipeline already running.")
+                
+            trigger_pipeline = st.button(
+                "🚀 Run Pipeline", 
+                type="primary", 
+                use_container_width=True,
+                disabled=run_btn_disabled
+            )
+            
+            if trigger_pipeline:
+                # 1. Prevent duplicate triggers check
+                if run_status_text in ["RUNNING", "QUEUED"]:
+                    st.error("❌ Trigger Blocked: Pipeline is already running or queued.")
+                    log_operation("duplicate_prevention", "Trigger blocked: Pipeline is already running/queued.")
+                else:
+                    triggered = False
+                    msg = ""
+                    if api_url:
+                        from airflow_client import check_dag_safety, trigger_airflow_dag
+                        # 2. Safety Pre-flight checks
+                        is_safe, safety_err = check_dag_safety(api_url, username, password)
+                        if not is_safe:
+                            st.error(f"❌ Safety Check Failed: {safety_err}")
+                            log_operation("safety_check_failure", f"Trigger blocked: {safety_err}")
+                        else:
+                            # 3. Trigger run
+                            triggered, msg = trigger_airflow_dag(api_url, username, password)
+                            if triggered:
+                                log_operation("trigger", f"User triggered pipeline execution for staged file: {staged_filename}")
+                                st.success("Pipeline run triggered successfully!")
+                                time.sleep(1.5)
+                                st.rerun()
+                            else:
+                                log_operation("trigger_failure", f"Failed to trigger DAG: {msg}")
+                                st.error(f"Failed to trigger: {msg}")
+                    else:
+                        st.error("Airflow connection is disabled. Enable it in settings.")
 
     # System Health Panel & Dataset Information
     st.divider()
@@ -798,5 +1018,5 @@ elif page == "Data Quality & Observability":
 
 # ----------------- AUTO-REFRESH TRIGGER -----------------
 if status == "Pipeline running":
-    time.sleep(10)
+    time.sleep(3)
     st.rerun()

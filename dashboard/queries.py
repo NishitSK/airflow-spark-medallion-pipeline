@@ -12,7 +12,8 @@ from airflow_client import check_latest_dag_status
 def get_spark():
     return get_spark_session("Dashboard")
 
-def get_kpis(spark):
+@st.cache_data(ttl=10)
+def get_kpis(_spark):
     try:
         runtime_val = "0.00"
         if os.path.exists(METRICS_FILE):
@@ -20,7 +21,7 @@ def get_kpis(spark):
                 parts = f.read().strip().split(",")
                 if len(parts) >= 2: runtime_val = f"{float(parts[1]):.2f}"
 
-        total_unique = spark.read.format("delta").load(SILVER_PATH).count() if os.path.exists(SILVER_PATH) else 0
+        total_unique = _spark.read.format("delta").load(SILVER_PATH).count() if os.path.exists(SILVER_PATH) else 0
         return runtime_val, total_unique
     except:
         return "0.00", 0
@@ -104,9 +105,6 @@ def get_consolidated_status(api_url=None, username=None, password=None):
         state, run_date_str = check_latest_dag_status(api_url, username, password)
         if state is not None:
             # Map Airflow status to app status
-            if has_input_file and state in ["success", "failed"]:
-                return "Pipeline running", last_success_time, last_file, None, "Airflow API (File Ingesting)", "Bronze", "N/A"
-            
             if state in ["running", "queued"]:
                 # If running, query local file for active stage if possible
                 active_stage = local_stage if local_status == "running" else "Bronze"
@@ -114,17 +112,11 @@ def get_consolidated_status(api_url=None, username=None, password=None):
             elif state == "failed":
                 return "Pipeline failed", last_success_time, last_file, f"Latest Airflow DAG run '{run_date_str}' failed.", "Airflow API", "Failed", local_duration
             elif state == "success":
-                # If no files in input, we are resting
-                if not has_input_file:
-                    return "Pipeline completed", last_success_time, last_file, None, "Airflow API", "Finished", local_duration
-                return "Pipeline running", last_success_time, last_file, None, "Airflow API (Active)", "Bronze", "N/A"
+                return "Pipeline completed", last_success_time, last_file, None, "Airflow API", "Finished", local_duration
 
     # 2. Check local status file
     if local_status:
         file_name = local_file_name or last_file
-        if has_input_file:
-            return "Pipeline running", last_success_time, input_file_name or file_name, None, "Local Status (New File Ingesting)", "Bronze", "N/A"
-        
         if local_status == "running":
             return "Pipeline running", last_success_time, file_name, None, "Local Status", local_stage, "N/A"
         elif local_status == "failed":
@@ -133,9 +125,6 @@ def get_consolidated_status(api_url=None, username=None, password=None):
             return "Pipeline completed", last_success_time, file_name, None, "Local Status", "Finished", local_duration
 
     # 3. Infer from filesystem
-    if has_input_file:
-        return "Pipeline running", last_success_time, input_file_name or last_file, None, "Filesystem Inference (Input File)", "Bronze", "N/A"
-    
     if last_success_time != "N/A":
         return "Pipeline completed", last_success_time, last_file, None, "Filesystem Inference", "Finished", local_duration
         
@@ -287,7 +276,8 @@ def get_file_preview(filepath):
         pass
     return None
 
-def get_pipeline_history(spark):
+@st.cache_data(ttl=10)
+def get_pipeline_history(_spark):
     """
     Retrieves the latest 20 pipeline run records.
     Parses HISTORY_FILE (JSONL), falling back to Silver table Delta log history if empty.
@@ -306,11 +296,11 @@ def get_pipeline_history(spark):
             pass
             
     # 2. If no logs yet, fallback to querying Delta Lake log history
-    if not runs and spark is not None:
+    if not runs and _spark is not None:
         try:
             from delta.tables import DeltaTable
             if os.path.exists(SILVER_PATH):
-                dt_silver = DeltaTable.forPath(spark, SILVER_PATH)
+                dt_silver = DeltaTable.forPath(_spark, SILVER_PATH)
                 history_df = dt_silver.history().select("timestamp", "version", "operation", "operationMetrics").toPandas()
                 history_df.sort_values("version", ascending=False, inplace=True)
                 
@@ -392,7 +382,8 @@ def get_dq_audit_details(spark):
         
     return audit_data
 
-def get_dq_trends(spark):
+@st.cache_data(ttl=10)
+def get_dq_trends(_spark):
     """
     Retrieves all history validation metrics from DQ_METRICS_PATH.
     """
@@ -401,8 +392,8 @@ def get_dq_trends(spark):
     import numpy as np
     
     try:
-        if os.path.exists(DQ_METRICS_PATH):
-            df = spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").asc()).toPandas()
+        if os.path.exists(DQ_METRICS_PATH) and _spark is not None:
+            df = _spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").asc()).toPandas()
             if not df.empty:
                 # Replace 0 total_rows with NaN to prevent divide-by-zero
                 total = df['total_rows'].replace(0, np.nan)
@@ -426,7 +417,8 @@ def get_dq_trends(spark):
         print(f"Error fetching DQ trends: {str(e)}")
     return pd.DataFrame()
 
-def get_incidents(spark):
+@st.cache_data(ttl=10)
+def get_incidents(_spark):
     """
     Retrieves logged incidents and execution traces from TRACE_PATH.
     """
@@ -434,13 +426,96 @@ def get_incidents(spark):
     import pandas as pd
     
     try:
-        if os.path.exists(TRACE_PATH):
-            df = spark.read.format("delta").load(TRACE_PATH)
+        if os.path.exists(TRACE_PATH) and _spark is not None:
+            df = _spark.read.format("delta").load(TRACE_PATH)
             incidents_df = df.orderBy(col("timestamp").desc()).limit(20).toPandas()
             return incidents_df
     except Exception as e:
         print(f"Error fetching incidents: {str(e)}")
     return pd.DataFrame()
+
+@st.cache_data(ttl=10)
+def get_last_run_summary(_spark):
+    """
+    Fetches details of the last completed or failed run for the summary card.
+    Returns a dict with status, start_time, end_time, duration, rows_processed, dq_score.
+    """
+    import os
+    import json
+    import pandas as pd
+    from pipeline.config import HISTORY_FILE, DQ_METRICS_PATH
+    
+    summary = {
+        "status": "N/A",
+        "start_time": "N/A",
+        "end_time": "N/A",
+        "duration": "N/A",
+        "rows": "0",
+        "dq_score": "N/A"
+    }
+    
+    # 1. Fetch latest record from history
+    last_record = None
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                lines = f.readlines()
+                if lines:
+                    last_record = json.loads(lines[-1].strip())
+        except:
+            pass
+            
+    if last_record:
+        raw_status = last_record.get("status", "N/A")
+        if raw_status == "completed":
+            summary["status"] = "Success"
+        elif raw_status == "failed":
+            summary["status"] = "Failed"
+        else:
+            summary["status"] = raw_status.capitalize()
+            
+        duration_val = last_record.get("duration", "N/A")
+        if isinstance(duration_val, (int, float)):
+            summary["duration"] = f"{duration_val:.2f}s"
+        else:
+            try:
+                summary["duration"] = f"{float(duration_val):.2f}s"
+            except:
+                summary["duration"] = str(duration_val) + ("s" if duration_val != "N/A" else "")
+            
+        rows_val = last_record.get("rows", 0)
+        summary["rows"] = f"{rows_val:,}" if isinstance(rows_val, (int, float)) else str(rows_val)
+        
+        # Estimate start and end times
+        timestamp = last_record.get("timestamp")
+        if timestamp:
+            from datetime import datetime
+            dt_end = datetime.fromtimestamp(timestamp)
+            summary["end_time"] = dt_end.strftime("%Y-%m-%d %H:%M:%S")
+            
+            try:
+                dur_float = float(duration_val)
+                dt_start = datetime.fromtimestamp(timestamp - dur_float)
+                summary["start_time"] = dt_start.strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                summary["start_time"] = summary["end_time"]
+                
+    # 2. Fetch last DQ Score
+    try:
+        if os.path.exists(DQ_METRICS_PATH) and _spark is not None:
+            from pyspark.sql.functions import col
+            dq_df = _spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").desc()).limit(1).toPandas()
+            if not dq_df.empty:
+                row = dq_df.iloc[0]
+                total_val = int(row["total_rows"])
+                failed = int(row["null_ids"]) + int(row["invalid_ages"]) + int(row["duplicate_ids"])
+                passed = max(0, total_val - failed)
+                dq_score = (passed / total_val * 100) if total_val > 0 else 100.0
+                summary["dq_score"] = f"{dq_score:.1f}%"
+    except Exception as e:
+        print(f"Error fetching last DQ score for summary: {e}")
+        
+    return summary
 
 
 
