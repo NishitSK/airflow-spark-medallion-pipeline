@@ -9,5 +9,5 @@ ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 
 USER airflow
 
-RUN pip install pyspark delta-spark streamlit plotly pandas pendulum
+RUN pip install pyspark delta-spark streamlit plotly pandas pendulum asyncpg psycopg2-binary
 

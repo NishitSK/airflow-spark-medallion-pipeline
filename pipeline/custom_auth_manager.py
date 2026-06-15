@@ -31,15 +31,18 @@ class CustomSimpleAuthManager(SimpleAuthManager):
         # Avoid running parent's init() to prevent writing/generating password files to disk.
         user = os.environ.get("AIRFLOW_ADMIN_USER", "admin")
         
+        msg_auth = "Active Auth Manager: CustomSimpleAuthManager"
         msg_user = f"Configured Airflow User: {user}"
         msg_source = "Credential Source: .env"
         
         # Log to the airflow logger
+        log.info(msg_auth)
         log.info(msg_user)
         log.info(msg_source)
         
         # Print using simple auth manager's own standard formatted output so it is
         # explicitly written to stdout/console.
+        self._print_output(msg_auth)
         self._print_output(msg_user)
         self._print_output(msg_source)
 
