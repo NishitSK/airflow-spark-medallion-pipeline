@@ -40,8 +40,6 @@ services:
       - ../.env
     environment:
       PYTHONPATH: "/app"
-      AIRFLOW_ADMIN_USER: "${AIRFLOW_ADMIN_USER}"
-      AIRFLOW_ADMIN_PASSWORD: "${AIRFLOW_ADMIN_PASSWORD}"
     volumes:
       - ../dashboard:/app
       - ../pipeline:/app/pipeline

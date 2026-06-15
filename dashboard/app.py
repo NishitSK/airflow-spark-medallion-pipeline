@@ -78,38 +78,25 @@ def get_friendly_connection_error(results):
         return "System Initialization Error: The required data engineering pipeline DAG was not found on the scheduler. Please ensure the pipeline is deployed."
     return results.get("error_message") or "An unexpected system error occurred while connecting to the pipeline scheduler."
 
-# Load Airflow configuration programmatically from environment variables
-st.session_state.use_airflow_api = True
-st.session_state.airflow_api_url = os.environ.get("AIRFLOW_API_URL", "http://airflow:8080")
-st.session_state.airflow_username = os.environ.get("AIRFLOW_ADMIN_USER", "admin")
-st.session_state.airflow_password = os.environ.get("AIRFLOW_ADMIN_PASSWORD", "admin123")
-
 # Startup connection validation state
 if "connection_verified" not in st.session_state:
     st.session_state.connection_verified = None
 if "connection_error" not in st.session_state:
     st.session_state.connection_error = None
 
-def reset_connection_status():
-    st.session_state.connection_verified = None
-    st.session_state.connection_error = None
-
 if st.session_state.connection_verified is None:
     try:
-        from airflow_client import run_connection_diagnostics
-        success, results = run_connection_diagnostics(
-            st.session_state.airflow_api_url,
-            st.session_state.airflow_username,
-            st.session_state.airflow_password
-        )
-        st.session_state.connection_verified = success
-        if not success:
-            st.session_state.connection_error = get_friendly_connection_error(results)
+        import airflow_client
+        health = airflow_client.get_orchestrator_health()
+        if health == "UNAVAILABLE":
+            st.session_state.connection_verified = False
+            st.session_state.connection_error = "Pipeline service unavailable."
         else:
+            st.session_state.connection_verified = True
             st.session_state.connection_error = None
     except Exception as e:
         st.session_state.connection_verified = False
-        st.session_state.connection_error = "System Connection Error: An unexpected error occurred while verifying the pipeline connection."
+        st.session_state.connection_error = "Pipeline service unavailable."
 
 # Sidebar Design
 with st.sidebar:
@@ -126,13 +113,8 @@ with st.sidebar:
     st.divider()
     st.caption("Production Build: v3.0")
 
-# Fetch Connection Settings
-api_url = st.session_state.airflow_api_url if st.session_state.use_airflow_api else None
-username = st.session_state.airflow_username
-password = st.session_state.airflow_password
-
 # Retrieve status from consolidated pipeline states
-status, last_success, last_file, error_msg, status_src, stage, duration = get_consolidated_status(api_url, username, password)
+status, last_success, last_file, error_msg, status_src, stage, duration = get_consolidated_status()
 
 # Completion notify check
 if "last_status" not in st.session_state:
@@ -152,14 +134,13 @@ latest_run_rows = history_records[0].get("rows", 0) if history_records else 0
 
 # Retrieve the latest run state to determine the indicators
 run_status_text = "N/A"
-if api_url:
-    try:
-        from airflow_client import get_latest_run_details
-        details_ind, err_ind = get_latest_run_details(api_url, username, password)
-        if not err_ind and details_ind:
-            run_status_text = details_ind.get("state", "N/A").upper()
-    except:
-        pass
+try:
+    import airflow_client
+    details_ind, err_ind = airflow_client.get_latest_run()
+    if not err_ind and details_ind:
+        run_status_text = details_ind.get("state", "N/A").upper()
+except:
+    pass
 
 # Convert status to display state
 status_indicator = "🟢 Pipeline Ready"
@@ -345,26 +326,19 @@ if page == "Pipeline Dashboard":
         failed_cnt = 0
         run_status_text = "N/A"
         
-        if api_url:
-            from airflow_client import get_latest_run_details, get_dag_runs
-            details, err = get_latest_run_details(api_url, username, password)
+        try:
+            import airflow_client
+            details, err = airflow_client.get_latest_run()
             if not err and details:
                 run_details = details
                 run_status_text = details.get("state", "N/A").upper()
                 
-            runs, err_runs = get_dag_runs(api_url, username, password)
-            if not err_runs and runs:
-                for run in runs:
-                    state_val = run.get("state")
-                    if state_val == "queued":
-                        queued_cnt += 1
-                    elif state_val == "running":
-                        running_cnt += 1
-                    elif state_val == "success":
-                        success_cnt += 1
-                    elif state_val == "failed":
-                        failed_cnt += 1
-        else:
+            counts = airflow_client.get_run_counts()
+            queued_cnt = counts.get("queued", 0)
+            running_cnt = counts.get("running", 0)
+            success_cnt = counts.get("success", 0)
+            failed_cnt = counts.get("failed", 0)
+        except Exception:
             # Fallback to local status
             if local_status:
                 run_status_text = local_status.upper()
@@ -429,13 +403,13 @@ if page == "Pipeline Dashboard":
                 except:
                     pass
             
-            conn_ok = st.session_state.connection_verified if st.session_state.use_airflow_api else True
+            conn_ok = st.session_state.connection_verified
             run_btn_disabled = not has_input or (run_status_text in ["RUNNING", "QUEUED"]) or not conn_ok
             
             if not has_input:
                 st.caption("⚠️ Upload/load a file first")
             elif not conn_ok:
-                st.caption(f"❌ Connection check failed: {st.session_state.connection_error or 'Verify settings and test connection'}")
+                st.caption(f"❌ {st.session_state.connection_error or 'Pipeline service unavailable.'}")
             else:
                 st.caption(f"Staged: `{staged_filename[:20]}`")
                 
@@ -450,44 +424,21 @@ if page == "Pipeline Dashboard":
             )
             
             if trigger_pipeline:
-                # 1. Prevent duplicate triggers check
+                # Prevent duplicate triggers check
                 if run_status_text in ["RUNNING", "QUEUED"]:
-                    st.error("❌ Trigger Blocked: Pipeline is already running or queued.")
+                    st.error("❌ Pipeline is already running or queued.")
                     log_operation("duplicate_prevention", "Trigger blocked: Pipeline is already running/queued.")
                 else:
-                    triggered = False
-                    msg = ""
-                    if api_url:
-                        from airflow_client import check_dag_safety, trigger_airflow_dag
-                        # 2. Safety Pre-flight checks
-                        is_safe, safety_err = check_dag_safety(api_url, username, password)
-                        if not is_safe:
-                            # Map raw auth/connection errors to friendly alerts
-                            friendly_err = safety_err
-                            if any(k in str(safety_err).lower() for k in ["auth", "credential", "unauthorized", "401", "403"]):
-                                friendly_err = "System Configuration Error: The platform was unable to authenticate with the pipeline scheduler."
-                            elif any(k in str(safety_err).lower() for k in ["conn", "reach", "refuse", "host", "timeout"]):
-                                friendly_err = "System Connection Error: The platform was unable to connect to the pipeline scheduler."
-                            st.error(f"❌ Safety Check Failed: {friendly_err}")
-                            log_operation("safety_check_failure", f"Trigger blocked: {safety_err}")
-                        else:
-                            # 3. Trigger run
-                            triggered, msg = trigger_airflow_dag(api_url, username, password)
-                            if triggered:
-                                log_operation("trigger", f"User triggered pipeline execution for staged file: {staged_filename}")
-                                st.success("Pipeline run triggered successfully!")
-                                time.sleep(1.5)
-                                st.rerun()
-                            else:
-                                friendly_msg = msg
-                                if any(k in str(msg).lower() for k in ["auth", "credential", "unauthorized", "401", "403"]):
-                                    friendly_msg = "System Configuration Error: The platform was unable to authenticate with the pipeline scheduler."
-                                elif any(k in str(msg).lower() for k in ["conn", "reach", "refuse", "host", "timeout"]):
-                                    friendly_msg = "System Connection Error: The platform was unable to connect to the pipeline scheduler."
-                                log_operation("trigger_failure", f"Failed to trigger DAG: {msg}")
-                                st.error(f"Failed to trigger: {friendly_msg}")
+                    import airflow_client
+                    triggered, msg = airflow_client.trigger_pipeline()
+                    if triggered:
+                        log_operation("trigger", f"Pipeline trigger accepted for file: {staged_filename}")
+                        st.success("Pipeline triggered successfully.")
+                        time.sleep(1.5)
+                        st.rerun()
                     else:
-                        st.error("Orchestrator sync is disabled.")
+                        log_operation("trigger_failure", f"Unable to trigger pipeline: {msg}")
+                        st.error(f"❌ Unable to trigger pipeline: {msg}")
 
     # ----------------- LIVE PROCESSING PROGRESS -----------------
     if status == "Pipeline running":
@@ -586,16 +537,11 @@ if page == "Pipeline Dashboard":
             st.subheader("🏥 System Health Monitor")
             
             # Health check variables
-            airflow_status = "🔴 Disconnected"
-            if st.session_state.use_airflow_api:
-                from airflow_client import test_airflow_connection
-                success, _ = test_airflow_connection(
-                    st.session_state.airflow_api_url,
-                    st.session_state.airflow_username,
-                    st.session_state.airflow_password
-                )
-                if success:
-                    airflow_status = "🟢 Connected"
+            airflow_status = "🔴 Unavailable"
+            import airflow_client
+            health = airflow_client.get_orchestrator_health()
+            if health != "UNAVAILABLE":
+                airflow_status = "🟢 Ready" if health == "READY" else "🟡 Active"
             
             spark_status = "🟢 Available" if spark is not None else "🔴 Unavailable"
             input_writable = "🟢 Accessible" if os.access(INPUT_PATH, os.W_OK) else "🔴 Inaccessible"
@@ -603,7 +549,7 @@ if page == "Pipeline Dashboard":
             output_dir = os.path.dirname(STATUS_FILE)
             output_writable = "🟢 Accessible" if os.access(output_dir, os.W_OK) else "🔴 Inaccessible"
             
-            st.markdown(f"**Airflow Connection:** {airflow_status}")
+            st.markdown(f"**Pipeline Scheduler:** {airflow_status}")
             st.markdown(f"**Spark Availability:** {spark_status}")
             st.markdown(f"**Input Folder Access:** {input_writable}")
             st.markdown(f"**Output Folder Access:** {output_writable}")
@@ -842,16 +788,11 @@ elif page == "Data Quality & Observability":
             st.subheader("🏥 Operational Monitoring")
             
             # Connection statuses
-            airflow_status = "🔴 Disconnected"
-            if st.session_state.use_airflow_api:
-                from airflow_client import test_airflow_connection
-                success, _ = test_airflow_connection(
-                    st.session_state.airflow_api_url,
-                    st.session_state.airflow_username,
-                    st.session_state.airflow_password
-                )
-                if success:
-                    airflow_status = "🟢 Connected"
+            airflow_status = "🔴 Unavailable"
+            import airflow_client
+            health = airflow_client.get_orchestrator_health()
+            if health != "UNAVAILABLE":
+                airflow_status = "🟢 Ready" if health == "READY" else "🟡 Active"
                     
             spark_status = "🟢 Available" if spark is not None else "🔴 Unavailable"
             
@@ -870,7 +811,7 @@ elif page == "Data Quality & Observability":
             
             dur_val = f"{duration:.2f}s" if isinstance(duration, (int, float)) else (f"{float(duration):.2f}s" if (duration != "N/A" and duration is not None and str(duration).replace('.', '', 1).isdigit()) else "N/A")
             
-            st.markdown(f"**Airflow Scheduler:** {airflow_status}")
+            st.markdown(f"**Pipeline Scheduler:** {airflow_status}")
             st.markdown(f"**Spark SQL Engine:** {spark_status}")
             st.markdown(f"**Data Lake Catalog:** {dl_status}")
             st.markdown(f"**Last Run Duration:** `{dur_val}`")

@@ -5,7 +5,7 @@ import streamlit as st
 import random
 from pipeline.config import BRONZE_PATH, SILVER_PATH, GOLD_PATH, TRACE_PATH, DQ_METRICS_PATH, METRICS_FILE, STATUS_FILE, INPUT_PATH, ARCHIVE_PATH, SAMPLES_PATH, HISTORY_FILE
 from pipeline.delta_utils import get_spark_session
-from airflow_client import check_latest_dag_status
+import airflow_client
 
 
 @st.cache_resource
@@ -52,7 +52,7 @@ def get_last_uploaded_file():
 
 def get_consolidated_status(api_url=None, username=None, password=None):
     """
-    Determines current status of pipeline using Airflow API and filesystem state checks.
+    Determines current status of pipeline using the orchestration client and filesystem state checks.
     Returns (status, last_run_timestamp, last_file, error_message, source_method, stage, duration)
     """
     has_input_file = False
@@ -100,19 +100,23 @@ def get_consolidated_status(api_url=None, username=None, password=None):
         except:
             pass
 
-    # 1. Check Airflow API if online
-    if api_url:
-        state, run_date_str = check_latest_dag_status(api_url, username, password)
-        if state is not None:
-            # Map Airflow status to app status
+    # 1. Check Pipeline API
+    try:
+        latest_run, error = airflow_client.get_latest_run()
+        if latest_run and not error:
+            state = latest_run.get("state")
+            run_date_str = latest_run.get("start_time")
+            # Map status to app status
             if state in ["running", "queued"]:
                 # If running, query local file for active stage if possible
                 active_stage = local_stage if local_status == "running" else "Bronze"
-                return "Pipeline running", last_success_time, last_file, None, f"Airflow API ({state})", active_stage, local_duration
+                return "Pipeline running", last_success_time, last_file, None, f"Pipeline Service ({state})", active_stage, local_duration
             elif state == "failed":
-                return "Pipeline failed", last_success_time, last_file, f"Latest Airflow DAG run '{run_date_str}' failed.", "Airflow API", "Failed", local_duration
+                return "Pipeline failed", last_success_time, last_file, f"Latest pipeline run '{run_date_str}' failed.", "Pipeline Service", "Failed", local_duration
             elif state == "success":
-                return "Pipeline completed", last_success_time, last_file, None, "Airflow API", "Finished", local_duration
+                return "Pipeline completed", last_success_time, last_file, None, "Pipeline Service", "Finished", local_duration
+    except Exception:
+        pass
 
     # 2. Check local status file
     if local_status:
