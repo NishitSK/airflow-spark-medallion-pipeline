@@ -121,6 +121,12 @@ with st.sidebar:
         st.session_state.airflow_username = st.text_input("API Username", value=st.session_state.airflow_username, on_change=reset_connection_status)
         st.session_state.airflow_password = st.text_input("API Password", value=st.session_state.airflow_password, type="password", on_change=reset_connection_status)
         
+        st.divider()
+        st.markdown("##### Authentication Source")
+        st.text(f"User: {st.session_state.airflow_username}")
+        st.text("Source: .env")
+        st.divider()
+        
         if st.button("🔌 Test Connection", use_container_width=True):
             from airflow_client import run_connection_diagnostics
             success, results = run_connection_diagnostics(

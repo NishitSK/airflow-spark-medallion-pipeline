@@ -30,17 +30,30 @@ def get_airflow_token(api_url, username, password):
             timeout=3,
             verify=False
         )
-        if response.status_code == 200:
-            token = response.json().get("access_token")
+        
+        # Add temporary debugging
+        print("AUTH STATUS:", response.status_code)
+        print("AUTH BODY:", response.text)
+        
+        if response.status_code in [200, 201]:
+            payload = response.json()
+            token = (
+                payload.get("access_token")
+                or payload.get("token")
+                or payload.get("jwt")
+            )
             if token:
                 if st and cache_key:
                     st.session_state[cache_key] = token
                 return token, None
-            return None, "Authentication succeeded, but no access token was returned."
+            return None, f"Authentication succeeded (HTTP {response.status_code}), but no access token was returned. Response: {response.text}"
         elif response.status_code in [401, 403]:
-            return None, "Authentication failed: Invalid username or password."
+            return None, f"Authentication failed (HTTP {response.status_code}): Invalid username or password. Response: {response.text}"
         else:
-            return None, f"Authentication failed (HTTP {response.status_code})."
+            return None, (
+                f"Authentication failed (HTTP {response.status_code}). "
+                f"Response: {response.text}"
+            )
     except requests.exceptions.RequestException as e:
         return None, f"Could not reach Airflow server at {api_url}. Check server status."
 

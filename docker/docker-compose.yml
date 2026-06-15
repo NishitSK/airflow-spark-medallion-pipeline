@@ -21,7 +21,7 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:admin"
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: "/opt/airflow/simple_auth_manager_passwords.json"
+      AIRFLOW__CORE__AUTH_MANAGER: "pipeline.custom_auth_manager.CustomSimpleAuthManager"
       PYTHONPATH: "/opt/airflow"
     volumes:
       - ../dags:/opt/airflow/dags
@@ -31,7 +31,7 @@ services:
       - ../data:/data
     ports:
       - "8081:8080"
-    command: bash -c "python -c \"import os, json; json.dump({os.environ.get('AIRFLOW_ADMIN_USER', 'admin'): os.environ.get('AIRFLOW_ADMIN_PASSWORD', 'admin123')}, open('/opt/airflow/simple_auth_manager_passwords.json', 'w'))\" && exec airflow standalone"
+    command: airflow standalone
 
   streamlit:
     build: .
