@@ -68,15 +68,21 @@ try:
 except:
     pass
 
-# Initialize session state for Airflow settings
-if "use_airflow_api" not in st.session_state:
-    st.session_state.use_airflow_api = True
-if "airflow_api_url" not in st.session_state:
-    st.session_state.airflow_api_url = "http://airflow:8080"
-if "airflow_username" not in st.session_state:
-    st.session_state.airflow_username = os.environ.get("AIRFLOW_ADMIN_USER", "admin")
-if "airflow_password" not in st.session_state:
-    st.session_state.airflow_password = os.environ.get("AIRFLOW_ADMIN_PASSWORD", "admin123")
+# Helper to map connection diagnostics results to friendly system errors
+def get_friendly_connection_error(results):
+    if not results.get("reachable", False):
+        return "System Connection Error: The platform was unable to connect to the background pipeline scheduler. Please ensure that the services are online."
+    if not results.get("authenticated", False):
+        return "System Configuration Error: The platform was unable to authenticate with the background pipeline scheduler. Please verify that the system environment credentials are configured correctly."
+    if not results.get("dag_found", False):
+        return "System Initialization Error: The required data engineering pipeline DAG was not found on the scheduler. Please ensure the pipeline is deployed."
+    return results.get("error_message") or "An unexpected system error occurred while connecting to the pipeline scheduler."
+
+# Load Airflow configuration programmatically from environment variables
+st.session_state.use_airflow_api = True
+st.session_state.airflow_api_url = os.environ.get("AIRFLOW_API_URL", "http://airflow:8080")
+st.session_state.airflow_username = os.environ.get("AIRFLOW_ADMIN_USER", "admin")
+st.session_state.airflow_password = os.environ.get("AIRFLOW_ADMIN_PASSWORD", "admin123")
 
 # Startup connection validation state
 if "connection_verified" not in st.session_state:
@@ -88,7 +94,7 @@ def reset_connection_status():
     st.session_state.connection_verified = None
     st.session_state.connection_error = None
 
-if st.session_state.use_airflow_api and st.session_state.connection_verified is None:
+if st.session_state.connection_verified is None:
     try:
         from airflow_client import run_connection_diagnostics
         success, results = run_connection_diagnostics(
@@ -97,10 +103,13 @@ if st.session_state.use_airflow_api and st.session_state.connection_verified is 
             st.session_state.airflow_password
         )
         st.session_state.connection_verified = success
-        st.session_state.connection_error = results.get("error_message") if not success else None
+        if not success:
+            st.session_state.connection_error = get_friendly_connection_error(results)
+        else:
+            st.session_state.connection_error = None
     except Exception as e:
         st.session_state.connection_verified = False
-        st.session_state.connection_error = f"Diagnostics error: {str(e)}"
+        st.session_state.connection_error = "System Connection Error: An unexpected error occurred while verifying the pipeline connection."
 
 # Sidebar Design
 with st.sidebar:
@@ -114,50 +123,6 @@ with st.sidebar:
         index=0
     )
     
-    st.divider()
-    with st.expander("⚙️ Connection Settings"):
-        st.session_state.use_airflow_api = st.checkbox("Enable Orchestrator Sync", value=st.session_state.use_airflow_api, on_change=reset_connection_status)
-        st.session_state.airflow_api_url = st.text_input("Scheduler API URL", value=st.session_state.airflow_api_url, on_change=reset_connection_status)
-        st.session_state.airflow_username = st.text_input("API Username", value=st.session_state.airflow_username, on_change=reset_connection_status)
-        st.session_state.airflow_password = st.text_input("API Password", value=st.session_state.airflow_password, type="password", on_change=reset_connection_status)
-        
-        st.divider()
-        st.markdown("##### Authentication Source")
-        st.text(f"User: {st.session_state.airflow_username}")
-        st.text("Source: .env")
-        st.divider()
-        
-        if st.button("🔌 Test Connection", use_container_width=True):
-            from airflow_client import run_connection_diagnostics
-            success, results = run_connection_diagnostics(
-                st.session_state.airflow_api_url,
-                st.session_state.airflow_username,
-                st.session_state.airflow_password
-            )
-            st.session_state.connection_verified = success
-            st.session_state.connection_error = results.get("error_message") if not success else None
-            
-            st.markdown("##### Connection Diagnostics")
-            if results["reachable"]:
-                st.success("✓ API reachable")
-            else:
-                st.error("✗ API reachable")
-                
-            if results["reachable"]:
-                if results["authenticated"]:
-                    st.success("✓ Authentication successful")
-                else:
-                    st.error("✗ Authentication failed")
-                    
-            if results["reachable"] and results["authenticated"]:
-                if results["dag_found"]:
-                    st.success("✓ DAG found")
-                else:
-                    st.error(f"✗ DAG found: {results.get('error_message')}")
-                    
-            if not success and results.get("error_message"):
-                st.error(f"Error Details: {results['error_message']}")
-
     st.divider()
     st.caption("Production Build: v3.0")
 
@@ -238,6 +203,10 @@ def get_user_friendly_error(err):
 if page == "Pipeline Dashboard":
     st.title("📊 Self-Service Medallion Data Platform")
     st.divider()
+    
+    # Display friendly system connection error banner at the top if validation failed
+    if st.session_state.connection_verified is False:
+        st.error(f"⚠️ {st.session_state.connection_error or 'Pipeline scheduler is currently offline.'}")
     
     def clear_input_folder():
         if os.path.exists(INPUT_PATH):
@@ -493,7 +462,13 @@ if page == "Pipeline Dashboard":
                         # 2. Safety Pre-flight checks
                         is_safe, safety_err = check_dag_safety(api_url, username, password)
                         if not is_safe:
-                            st.error(f"❌ Safety Check Failed: {safety_err}")
+                            # Map raw auth/connection errors to friendly alerts
+                            friendly_err = safety_err
+                            if any(k in str(safety_err).lower() for k in ["auth", "credential", "unauthorized", "401", "403"]):
+                                friendly_err = "System Configuration Error: The platform was unable to authenticate with the pipeline scheduler."
+                            elif any(k in str(safety_err).lower() for k in ["conn", "reach", "refuse", "host", "timeout"]):
+                                friendly_err = "System Connection Error: The platform was unable to connect to the pipeline scheduler."
+                            st.error(f"❌ Safety Check Failed: {friendly_err}")
                             log_operation("safety_check_failure", f"Trigger blocked: {safety_err}")
                         else:
                             # 3. Trigger run
@@ -504,10 +479,15 @@ if page == "Pipeline Dashboard":
                                 time.sleep(1.5)
                                 st.rerun()
                             else:
+                                friendly_msg = msg
+                                if any(k in str(msg).lower() for k in ["auth", "credential", "unauthorized", "401", "403"]):
+                                    friendly_msg = "System Configuration Error: The platform was unable to authenticate with the pipeline scheduler."
+                                elif any(k in str(msg).lower() for k in ["conn", "reach", "refuse", "host", "timeout"]):
+                                    friendly_msg = "System Connection Error: The platform was unable to connect to the pipeline scheduler."
                                 log_operation("trigger_failure", f"Failed to trigger DAG: {msg}")
-                                st.error(f"Failed to trigger: {msg}")
+                                st.error(f"Failed to trigger: {friendly_msg}")
                     else:
-                        st.error("Airflow connection is disabled. Enable it in settings.")
+                        st.error("Orchestrator sync is disabled.")
 
     # ----------------- LIVE PROCESSING PROGRESS -----------------
     if status == "Pipeline running":
