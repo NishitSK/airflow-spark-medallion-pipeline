@@ -93,12 +93,14 @@ def trigger_pipeline(dag_id="file_trigger_pipeline") -> tuple[bool, str]:
     api_url = AIRFLOW_API_URL.rstrip('/')
     url = f"{api_url}/api/v2/dags/{dag_id}/dagRuns"
     try:
-        response = requests.post(url, headers=headers, json={}, timeout=3, verify=False)
+        import datetime
+        payload = {"logical_date": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        response = requests.post(url, headers=headers, json=payload, timeout=3, verify=False)
         if response.status_code in [401, 403]:
             _clear_token()
             headers, error = _get_auth_headers()
             if not error:
-                response = requests.post(url, headers=headers, json={}, timeout=3, verify=False)
+                response = requests.post(url, headers=headers, json=payload, timeout=3, verify=False)
                 
         if response.status_code in [200, 201]:
             log.info("Pipeline trigger accepted")

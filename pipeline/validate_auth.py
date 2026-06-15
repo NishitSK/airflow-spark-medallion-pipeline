@@ -7,12 +7,13 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 # Mock fcntl module for Windows compatibility
-from unittest.mock import MagicMock
-mock_fcntl = MagicMock()
-mock_fcntl.LOCK_EX = 1
-mock_fcntl.LOCK_NB = 2
-mock_fcntl.LOCK_UN = 8
-sys.modules['fcntl'] = mock_fcntl
+if os.name == 'nt':
+    from unittest.mock import MagicMock
+    mock_fcntl = MagicMock()
+    mock_fcntl.LOCK_EX = 1
+    mock_fcntl.LOCK_NB = 2
+    mock_fcntl.LOCK_UN = 8
+    sys.modules['fcntl'] = mock_fcntl
 
 # Load environment variables from .env if present
 env_file = ROOT_DIR / ".env"
