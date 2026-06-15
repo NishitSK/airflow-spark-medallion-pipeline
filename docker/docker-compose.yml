@@ -1,21 +1,4 @@
 services:
-  postgres:
-    image: postgres:15-alpine
-    container_name: postgres
-    environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   spark:
     image: apache/spark:4.0.0
     container_name: spark
@@ -27,156 +10,44 @@ services:
       - ../pipeline:/pipeline
     command: tail -f /dev/null
 
-  airflow-db-init:
+  airflow:
     build: .
     image: airflow-custom:latest
-    container_name: airflow-db-init
+    container_name: airflow
     depends_on:
-      postgres:
-        condition: service_healthy
-    env_file:
-      - ../.env
-    environment:
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC: postgresql+asyncpg://airflow:airflow@postgres/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:admin"
-      AIRFLOW__CORE__AUTH_MANAGER: "pipeline.custom_auth_manager.CustomSimpleAuthManager"
-      PYTHONPATH: "/opt/airflow"
-    volumes:
-      - ../dags:/opt/airflow/dags
-      - ../spark_jobs:/opt/airflow/spark_jobs
-      - ../pipeline:/opt/airflow/pipeline
-      - ../monitoring:/opt/airflow/monitoring
-      - ../data:/data
-    command: airflow db migrate
-
-  airflow-api-server:
-    image: airflow-custom:latest
-    container_name: airflow-api-server
-    depends_on:
-      postgres:
-        condition: service_healthy
-      airflow-db-init:
-        condition: service_completed_successfully
       spark:
         condition: service_started
     env_file:
       - ../.env
     environment:
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC: postgresql+asyncpg://airflow:airflow@postgres/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:admin"
-      AIRFLOW__CORE__AUTH_MANAGER: "pipeline.custom_auth_manager.CustomSimpleAuthManager"
-      PYTHONPATH: "/opt/airflow"
+      PYTHONPATH: "/opt/airflow/plugins:/opt/airflow"
+      PYTHONUNBUFFERED: "1"
     volumes:
       - ../dags:/opt/airflow/dags
       - ../spark_jobs:/opt/airflow/spark_jobs
       - ../pipeline:/opt/airflow/pipeline
       - ../monitoring:/opt/airflow/monitoring
+      - ../plugins:/opt/airflow/plugins
       - ../data:/data
     ports:
       - "8081:8080"
-    command: airflow api-server
-
-  airflow-scheduler:
-    image: airflow-custom:latest
-    container_name: airflow-scheduler
-    depends_on:
-      postgres:
-        condition: service_healthy
-      airflow-db-init:
-        condition: service_completed_successfully
-      spark:
-        condition: service_started
-    env_file:
-      - ../.env
-    environment:
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC: postgresql+asyncpg://airflow:airflow@postgres/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:admin"
-      AIRFLOW__CORE__AUTH_MANAGER: "pipeline.custom_auth_manager.CustomSimpleAuthManager"
-      PYTHONPATH: "/opt/airflow"
-    volumes:
-      - ../dags:/opt/airflow/dags
-      - ../spark_jobs:/opt/airflow/spark_jobs
-      - ../pipeline:/opt/airflow/pipeline
-      - ../monitoring:/opt/airflow/monitoring
-      - ../data:/data
-    command: airflow scheduler
-
-  airflow-dag-processor:
-    image: airflow-custom:latest
-    container_name: airflow-dag-processor
-    depends_on:
-      postgres:
-        condition: service_healthy
-      airflow-db-init:
-        condition: service_completed_successfully
-      spark:
-        condition: service_started
-    env_file:
-      - ../.env
-    environment:
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC: postgresql+asyncpg://airflow:airflow@postgres/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:admin"
-      AIRFLOW__CORE__AUTH_MANAGER: "pipeline.custom_auth_manager.CustomSimpleAuthManager"
-      PYTHONPATH: "/opt/airflow"
-    volumes:
-      - ../dags:/opt/airflow/dags
-      - ../spark_jobs:/opt/airflow/spark_jobs
-      - ../pipeline:/opt/airflow/pipeline
-      - ../monitoring:/opt/airflow/monitoring
-      - ../data:/data
-    command: airflow dag-processor
-
-  airflow-triggerer:
-    image: airflow-custom:latest
-    container_name: airflow-triggerer
-    depends_on:
-      postgres:
-        condition: service_healthy
-      airflow-db-init:
-        condition: service_completed_successfully
-      spark:
-        condition: service_started
-    env_file:
-      - ../.env
-    environment:
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN_ASYNC: postgresql+asyncpg://airflow:airflow@postgres/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:admin"
-      AIRFLOW__CORE__AUTH_MANAGER: "pipeline.custom_auth_manager.CustomSimpleAuthManager"
-      PYTHONPATH: "/opt/airflow"
-    volumes:
-      - ../dags:/opt/airflow/dags
-      - ../spark_jobs:/opt/airflow/spark_jobs
-      - ../pipeline:/opt/airflow/pipeline
-      - ../monitoring:/opt/airflow/monitoring
-      - ../data:/data
-    command: airflow triggerer
+    command: airflow standalone
 
   streamlit:
     image: airflow-custom:latest
     container_name: streamlit
     depends_on:
-      airflow-api-server:
+      airflow:
         condition: service_started
     env_file:
       - ../.env
     environment:
       PYTHONPATH: "/app"
-      AIRFLOW_API_URL: "http://airflow-api-server:8080"
+      AIRFLOW_API_URL: "http://airflow:8080"
+      PYTHONUNBUFFERED: "1"
     volumes:
       - ../dashboard:/app
       - ../pipeline:/app/pipeline
@@ -185,6 +56,3 @@ services:
       - "8501:8501"
     entrypoint: ["streamlit"]
     command: ["run", "/app/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
-
-volumes:
-  postgres_data:

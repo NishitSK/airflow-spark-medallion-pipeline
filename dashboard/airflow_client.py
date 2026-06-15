@@ -201,8 +201,10 @@ def get_pipeline_status(dag_id="file_trigger_pipeline") -> str:
     """
     global _last_status
     details, error = get_latest_run(dag_id)
-    if error or not details:
+    if error:
         return "UNAVAILABLE"
+    if not details:
+        return "READY"
         
     state = details.get("state", "").upper()
     if state == "RUNNING":
