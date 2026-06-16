@@ -796,7 +796,7 @@ def generate_txt_report(data):
     else:
         report.append(" - No Gold layer metrics aggregated yet.")
     report.append("==================================================")
-    report.append(" Watermark: MEDALLION SECURE                       ")
+    report.append(" Watermark: MEDALLION SECURE | MADE BY NISHIT      ")
     report.append("==================================================")
     
     return "\n".join(report)
@@ -822,7 +822,7 @@ def generate_pdf_report(data):
         def footer(self):
             self.set_y(-15)
             self.set_font("Helvetica", "I", 8)
-            self.cell(0, 10, f"Page {self.page_no()}/{{nb}} | MEDALLION SECURE", align="C")
+            self.cell(0, 10, f"Page {self.page_no()}/{{nb}} | MEDALLION SECURE | MADE BY NISHIT", align="C")
             
     pdf = PDF()
     pdf.add_page()
