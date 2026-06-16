@@ -112,7 +112,24 @@ def get_consolidated_status(api_url=None, username=None, password=None):
                 active_stage = local_stage if local_status == "running" else "Bronze"
                 return "Pipeline running", last_success_time, last_file, None, f"Pipeline Service ({state})", active_stage, local_duration
             elif state == "failed":
-                return "Pipeline failed", last_success_time, last_file, f"Latest pipeline run '{run_date_str}' failed.", "Pipeline Service", "Failed", local_duration
+                run_id = latest_run.get("run_id")
+                error_msg = f"Latest pipeline run '{run_date_str}' failed."
+                failed_stage = "Failed"
+                try:
+                    # Attempt to fetch task logs and extract exception
+                    task_id, log_text = airflow_client.get_failed_task_log(run_id)
+                    if log_text:
+                        exc_type, exc_msg, stage_name = airflow_client.extract_exception_from_log(log_text)
+                        if exc_type and exc_msg:
+                            error_msg = f"Exception: {exc_type}: {exc_msg}"
+                        if stage_name:
+                            failed_stage = stage_name
+                            error_msg += f" | Stage: {stage_name}"
+                        else:
+                            error_msg += f" | Stage: {task_id or 'Failed'}"
+                except Exception as log_err:
+                    print(f"Error extracting task log exception: {log_err}")
+                return "Pipeline failed", last_success_time, last_file, error_msg, "Pipeline Service", failed_stage, local_duration
             elif state == "success":
                 return "Pipeline completed", last_success_time, last_file, None, "Pipeline Service", "Finished", local_duration
     except Exception:
@@ -124,7 +141,16 @@ def get_consolidated_status(api_url=None, username=None, password=None):
         if local_status == "running":
             return "Pipeline running", last_success_time, file_name, None, "Local Status", local_stage, "N/A"
         elif local_status == "failed":
-            return "Pipeline failed", last_success_time, file_name, local_error, "Local Status", "Failed", local_duration
+            error_msg = local_error or "Unknown local pipeline failure."
+            if not error_msg.startswith("Exception: "):
+                # If there's a type: msg in local error, convert it
+                if ":" in error_msg and not error_msg.startswith("File "):
+                    parts = error_msg.split(":", 1)
+                    error_msg = f"Exception: {parts[0].strip()}: {parts[1].strip()}"
+                else:
+                    error_msg = f"Exception: PipelineError: {error_msg}"
+            error_msg += f" | Stage: {local_stage or 'Failed'}"
+            return "Pipeline failed", last_success_time, file_name, error_msg, "Local Status", local_stage or "Failed", local_duration
         elif local_status == "completed":
             return "Pipeline completed", last_success_time, file_name, None, "Local Status", "Finished", local_duration
 

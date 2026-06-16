@@ -223,3 +223,101 @@ def get_run_counts(dag_id="file_trigger_pipeline") -> dict[str, int]:
     except:
         pass
     return counts
+
+def get_failed_task_log(dag_run_id, dag_id="file_trigger_pipeline") -> tuple[str | None, str | None]:
+    """
+    Finds the failed task in the given DAG run, fetches its logs, and returns (task_id, logs_text).
+    """
+    headers, error = _get_auth_headers()
+    if error:
+        return None, None
+        
+    # 1. Get task instances for the DAG run
+    url = f"{AIRFLOW_API_URL}/api/v2/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances"
+    try:
+        response = requests.get(url, headers=headers, timeout=3, verify=False)
+        if response.status_code == 200:
+            tis = response.json().get("task_instances", [])
+            failed_ti = None
+            for ti in tis:
+                if ti.get("state") == "failed":
+                    failed_ti = ti
+                    break
+            
+            # If no failed task found, default to unified_medallion_pipeline
+            task_id = failed_ti.get("task_id") if failed_ti else "unified_medallion_pipeline"
+            try_number = failed_ti.get("try_number") if failed_ti else 1
+            if not try_number or try_number < 1:
+                try_number = 1
+                
+            # 2. Get the log for the task instance
+            log_url = f"{AIRFLOW_API_URL}/api/v2/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}/logs/{try_number}"
+            log_response = requests.get(log_url, headers=headers, timeout=3, verify=False)
+            if log_response.status_code == 200:
+                return task_id, log_response.text
+    except Exception as e:
+        log.error(f"Error fetching logs: {str(e)}")
+    return None, None
+
+def extract_exception_from_log(log_text: str) -> tuple[str | None, str | None, str | None]:
+    """
+    Parses Airflow task log text to extract:
+    (exception_type, exception_message, failed_stage)
+    """
+    if not log_text:
+        return None, None, None
+
+    # Scan for medallions stage markers in log lines
+    failed_stage = None
+    if "[Layer 3: Gold]" in log_text:
+        failed_stage = "Gold"
+    elif "[Layer 2: Silver]" in log_text:
+        failed_stage = "Silver"
+    elif "[Layer 1.5: Data Quality Validation]" in log_text or "DQ Validation" in log_text:
+        failed_stage = "Validation"
+    elif "[Layer 1: Bronze]" in log_text:
+        failed_stage = "Bronze"
+    elif "archive" in log_text.lower():
+        failed_stage = "Archive"
+
+    # Search for python traceback
+    tb_marker = "Traceback (most recent call last):"
+    idx = log_text.rfind(tb_marker)
+    if idx != -1:
+        tb_lines = log_text[idx:].splitlines()
+        tb_lines = [line.strip() for line in tb_lines if line.strip()]
+        
+        # Traverse backwards to find the exception type and message
+        for i in range(len(tb_lines) - 1, -1, -1):
+            line = tb_lines[i]
+            if ":" in line and not line.startswith("File ") and not line.startswith("Traceback"):
+                # Clean trace logs line markers like "standalone | [..."
+                if " | " in line:
+                    line = line.split(" | ", 1)[1].strip()
+                parts = line.split(":", 1)
+                exc_type = parts[0].strip()
+                exc_msg = parts[1].strip()
+                return exc_type, exc_msg, failed_stage
+        
+        # Fallback to last line of traceback
+        if len(tb_lines) > 0:
+            last_line = tb_lines[-1]
+            if ":" in last_line:
+                parts = last_line.split(":", 1)
+                return parts[0].strip(), parts[1].strip(), failed_stage
+            return "Exception", last_line, failed_stage
+            
+    # If no traceback found, search for generic failed exits or logs
+    for line in reversed(log_text.splitlines()):
+        line = line.strip()
+        if "error" in line.lower() or "failed" in line.lower() or "exception" in line.lower():
+            # Clean standard container logging prefix if present
+            if " | " in line:
+                line = line.split(" | ", 1)[1].strip()
+            if ":" in line:
+                parts = line.split(":", 1)
+                return "Error", parts[1].strip(), failed_stage
+            return "Error", line, failed_stage
+
+    return None, None, failed_stage
+

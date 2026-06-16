@@ -167,26 +167,47 @@ elif run_status_text == "FAILED":
 def get_user_friendly_error(err):
     if not err:
         return "An unknown error occurred.", "Verify that the pipeline is deployed and folders are accessible."
-    err_lower = str(err).lower()
-    if "not found" in err_lower or "does not exist" in err_lower or "no such file" in err_lower or "missing" in err_lower:
-        return (
-            "A required storage path or Delta table directory is unavailable.",
-            "Verify that your local storage directories under data/ are mounted and writable. Ensure a dataset has been ingested first."
-        )
-    elif "halted due to critical data quality" in err_lower or "critical dq failure" in err_lower or "duplicate" in err_lower:
-        return (
-            "Halted due to critical Data Quality violations in raw data.",
-            "Verify that your input file does not contain duplicate IDs, null keys, or negative ages. Run the 'Medium Sample' to test clean execution."
-        )
+        
+    err_str = str(err)
+    err_lower = err_str.lower()
+    
+    # Parse structured error details if present (e.g. from Airflow logs)
+    # Format: "Exception: {exc_type}: {exc_msg} | Stage: {failed_stage}"
+    exc_details = ""
+    stage_details = ""
+    clean_err = err_str
+    
+    if " | Stage: " in err_str:
+        parts = err_str.split(" | Stage: ")
+        stage_details = f"\n\n**Failed Stage:** `{parts[1]}`"
+        clean_err = parts[0]
+        
+    if clean_err.startswith("Exception: "):
+        exc_details = f"\n\n**Exception Details:**\n`{clean_err[11:]}`"
+        clean_err = clean_err[11:]
+        
+    # Determine friendly explanation and suggested fix
+    if "permission denied" in err_lower or "permissionerror" in err_lower:
+        explanation = "A storage path or file write operation failed due to directory permission restrictions."
+        suggestion = "Verify write permissions on the data directories under `/data/` and ensure the container user (UID 50000) has write access to the mounted volumes."
+    elif "not found" in err_lower or "does not exist" in err_lower or "no such file" in err_lower or "missing" in err_lower:
+        explanation = "A required storage path or Delta table directory is unavailable."
+        suggestion = "Verify that your local storage directories under data/ are mounted and writable. Ensure a dataset has been ingested first."
+    elif "halted due to critical data quality" in err_lower or "critical dq failure" in err_lower or "duplicate" in err_lower or "data quality" in err_lower:
+        explanation = "Halted due to critical Data Quality violations in raw data."
+        suggestion = "Verify that your input file does not contain duplicate IDs, null keys, or negative ages. Run the 'Medium Sample' to test clean execution."
     elif "connection" in err_lower or "refused" in err_lower or "unreachable" in err_lower:
-        return (
-            "Unable to connect to the scheduling system or Spark cluster.",
-            "Check that the scheduler services and local cluster configurations are running."
-        )
-    return (
-        "An unexpected PySpark cluster or Delta Lake table write error occurred.",
-        "Check that the input format matches the expected columns (id, name, age) and that Spark cluster memory is healthy."
-    )
+        explanation = "Unable to connect to the scheduling system or Spark cluster."
+        suggestion = "Check that the scheduler services and local cluster configurations are running."
+    elif "modulenotfound" in err_lower or "no module named" in err_lower:
+        explanation = "A Python module import dependency is missing in the execution environment."
+        suggestion = "Ensure the module is installed in the container or check the PYTHONPATH configuration in docker-compose."
+    else:
+        explanation = "An unexpected PySpark cluster or Delta Lake table write error occurred."
+        suggestion = "Check that the input format matches the expected columns (id, name, age) and that Spark cluster memory is healthy."
+
+    reason = f"{explanation}{exc_details}{stage_details}"
+    return reason, suggestion
 
 # Failure UI logic moved inside page scope.
 
