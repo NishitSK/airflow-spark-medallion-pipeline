@@ -216,48 +216,92 @@ if page == "Pipeline Dashboard":
     with tab_upload:
         uploaded_file = st.file_uploader("Drop CSV or JSON format file here", type=['csv', 'json'])
         if uploaded_file is not None:
-            # Save file temporarily to extract metadata and render preview
-            temp_dir = os.path.join(INPUT_PATH, "temp")
-            temp_path = os.path.join(temp_dir, uploaded_file.name)
-            
-            from pathlib import Path
-            Path(temp_path).parent.mkdir(parents=True, exist_ok=True)
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+            # Determine writable application temp directory
+            import tempfile
+            temp_dir = "/tmp/uploads"
+            if os.name == "nt":
+                temp_dir = os.path.join(tempfile.gettempdir(), "uploads")
                 
-            # Fetch Metadata
-            sz_mb, rows, cols = get_file_metadata(temp_path)
+            # Ensure the directory exists
+            try:
+                os.makedirs(temp_dir, exist_ok=True)
+            except Exception as e:
+                # Fallback to python standard tempdir on error
+                temp_dir = os.path.join(tempfile.gettempdir(), "uploads")
+                try:
+                    os.makedirs(temp_dir, exist_ok=True)
+                except Exception as fallback_err:
+                    st.error(f"⚠️ Failed to create temporary upload directory: {fallback_err}")
+                    temp_dir = None
             
-            # Display metadata summary
-            st.markdown(f"**File Name:** `{uploaded_file.name}`")
-            col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-            col_m1.metric("Rows", f"{rows:,}")
-            col_m2.metric("Columns", f"{cols}")
-            col_m3.metric("Type", uploaded_file.name.split('.')[-1].upper())
-            col_m4.metric("Size", f"{sz_mb:.4f} MB")
-            col_m5.metric("Est. Processing Cost", f"${rows * 0.00001:.5f} USD")
-            
-            # Preview Frame
-            st.markdown("**Dataset Preview (First 10 records):**")
-            preview_df = get_file_preview(temp_path)
-            if preview_df is not None:
-                st.dataframe(preview_df, use_container_width=True)
+            # Validate write access before opening the file
+            is_writable = False
+            if temp_dir:
+                is_writable = os.access(temp_dir, os.W_OK)
+                
+            if not is_writable:
+                st.error("⚠️ Streamlit does not have write access to the temporary directory. Please check file permissions.")
             else:
-                st.info("Preview unavailable for this schema.")
+                temp_path = os.path.join(temp_dir, uploaded_file.name)
                 
-            if st.button("Process Dataset", type="primary", use_container_width=True):
-                # Clear old input files
-                clear_input_folder()
-                # Copy file from temp to final input folder
-                final_path = os.path.join(INPUT_PATH, uploaded_file.name)
-                from pathlib import Path
-                Path(final_path).parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(temp_path, final_path)
-                st.session_state.last_uploaded_file = uploaded_file.name
-                
-                st.success(f"File '{uploaded_file.name}' uploaded and staged successfully. Use the Pipeline Execution Panel below to run the pipeline.")
-                time.sleep(1.5)
-                st.rerun()
+                # Write file safely
+                write_success = False
+                try:
+                    with open(temp_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    write_success = True
+                except Exception as e:
+                    st.error(f"⚠️ Failed to write uploaded file to temporary directory: {str(e)}")
+                    
+                if write_success:
+                    # Fetch Metadata
+                    sz_mb, rows, cols = get_file_metadata(temp_path)
+                    
+                    # Display metadata summary
+                    st.markdown(f"**File Name:** `{uploaded_file.name}`")
+                    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+                    col_m1.metric("Rows", f"{rows:,}")
+                    col_m2.metric("Columns", f"{cols}")
+                    col_m3.metric("Type", uploaded_file.name.split('.')[-1].upper())
+                    col_m4.metric("Size", f"{sz_mb:.4f} MB")
+                    col_m5.metric("Est. Processing Cost", f"${rows * 0.00001:.5f} USD")
+                    
+                    # Preview Frame
+                    st.markdown("**Dataset Preview (First 10 records):**")
+                    preview_df = get_file_preview(temp_path)
+                    if preview_df is not None:
+                        st.dataframe(preview_df, use_container_width=True)
+                    else:
+                        st.info("Preview unavailable for this schema.")
+                        
+                    if st.button("Process Dataset", type="primary", use_container_width=True):
+                        # Validate landing zone write access
+                        if not os.access(INPUT_PATH, os.W_OK):
+                            st.error(f"⚠️ Streamlit does not have write access to the staging directory: `{INPUT_PATH}`")
+                        else:
+                            try:
+                                # Clear old input files
+                                clear_input_folder()
+                                # Copy file from temp to final input folder (landing zone)
+                                final_path = os.path.join(INPUT_PATH, uploaded_file.name)
+                                from pathlib import Path
+                                Path(final_path).parent.mkdir(parents=True, exist_ok=True)
+                                
+                                # Separate staging copy from temporary upload
+                                shutil.copyfile(temp_path, final_path)
+                                
+                                # Cleanup the temp file
+                                try:
+                                    os.remove(temp_path)
+                                except:
+                                    pass
+                                    
+                                st.session_state.last_uploaded_file = uploaded_file.name
+                                st.success(f"File '{uploaded_file.name}' uploaded and staged successfully. Use the Pipeline Execution Panel below to run the pipeline.")
+                                time.sleep(1.5)
+                                st.rerun()
+                            except Exception as stage_err:
+                                st.error(f"⚠️ Failed to copy dataset to staging folder: {str(stage_err)}")
                 
     with tab_sample:
         st.write("Load one of the project's pre-packaged datasets directly into the pipeline:")
