@@ -53,4 +53,8 @@ def write_delta(df, path, mode="append", partition_by=None):
         
     if partition_by:
         writer = writer.partitionBy(partition_by)
+        
+    from pathlib import Path
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     writer.save(path)
+

@@ -14,6 +14,7 @@ services:
     build: .
     image: airflow-custom:latest
     container_name: airflow
+    user: "50000:0"
     depends_on:
       spark:
         condition: service_started
@@ -34,11 +35,12 @@ services:
     ports:
       - "8081:8080"
     command: >
-      bash -c "echo '{\"${AIRFLOW_ADMIN_USER}\": \"${AIRFLOW_ADMIN_PASSWORD}\"}' > /opt/airflow/simple_auth_manager_passwords.json.generated && exec airflow standalone"
+      bash -c "python3 -c \"import pipeline.config\" && echo '{\"${AIRFLOW_ADMIN_USER}\": \"${AIRFLOW_ADMIN_PASSWORD}\"}' > /opt/airflow/simple_auth_manager_passwords.json.generated && exec airflow standalone"
 
   streamlit:
     image: airflow-custom:latest
     container_name: streamlit
+    user: "50000:0"
     depends_on:
       airflow:
         condition: service_started
@@ -54,5 +56,6 @@ services:
       - ../data:/data
     ports:
       - "8501:8501"
-    entrypoint: ["streamlit"]
-    command: ["run", "/app/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    entrypoint: []
+    command: >
+      bash -c "python3 -c \"import pipeline.config\" && exec streamlit run /app/app.py --server.port=8501 --server.address=0.0.0.0"

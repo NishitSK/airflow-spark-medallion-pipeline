@@ -55,3 +55,26 @@ JAVA_OPTS = (
     "--add-opens=java.base/sun.security.action=ALL-UNNAMED "
     "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED"
 )
+
+# Startup Directory Creation and Writability Validation
+from pathlib import Path
+import os
+
+for path in [
+    "/data/input",
+    "/data/output",
+    "/data/archive",
+    "/data/bronze",
+    "/data/silver",
+    "/data/gold",
+]:
+    try:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        # Test writability
+        test_file = Path(path) / f".write_test_{os.getpid()}"
+        test_file.touch(exist_ok=True)
+        test_file.unlink()
+        print(f"Directory {path}: writable")
+    except Exception:
+        print(f"Directory {path}: not writable")
+

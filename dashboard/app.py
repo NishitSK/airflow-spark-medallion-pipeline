@@ -218,9 +218,10 @@ if page == "Pipeline Dashboard":
         if uploaded_file is not None:
             # Save file temporarily to extract metadata and render preview
             temp_dir = os.path.join(INPUT_PATH, "temp")
-            os.makedirs(temp_dir, exist_ok=True)
             temp_path = os.path.join(temp_dir, uploaded_file.name)
             
+            from pathlib import Path
+            Path(temp_path).parent.mkdir(parents=True, exist_ok=True)
             with open(temp_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
                 
@@ -249,6 +250,8 @@ if page == "Pipeline Dashboard":
                 clear_input_folder()
                 # Copy file from temp to final input folder
                 final_path = os.path.join(INPUT_PATH, uploaded_file.name)
+                from pathlib import Path
+                Path(final_path).parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(temp_path, final_path)
                 st.session_state.last_uploaded_file = uploaded_file.name
                 
@@ -267,8 +270,26 @@ if page == "Pipeline Dashboard":
                 # Clear old input files
                 clear_input_folder()
                 
-                os.makedirs(INPUT_PATH, exist_ok=True)
-                shutil.copy(src, dest)
+                from pathlib import Path
+                Path(dest).parent.mkdir(parents=True, exist_ok=True)
+                
+                # Resilient deletion of existing file if any
+                if os.path.exists(dest):
+                    try:
+                        os.remove(dest)
+                    except Exception as remove_err:
+                        print(f"Failed to remove existing file {dest}: {remove_err}")
+                        
+                # Copy without preserving metadata/permissions, with fallback
+                try:
+                    shutil.copyfile(src, dest)
+                except Exception as copy_err:
+                    print(f"shutil.copyfile failed, trying manual read/write: {copy_err}")
+                    with open(src, "rb") as f_in:
+                        content = f_in.read()
+                    with open(dest, "wb") as f_out:
+                        f_out.write(content)
+                        
                 st.session_state.last_uploaded_file = file
                 
                 st.toast(f"{label} dataset staged in input directory.", icon="📥")
