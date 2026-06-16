@@ -149,7 +149,7 @@ with st.sidebar:
     )
     
     st.caption("Production Build: v3.0")
-    st.markdown("<div style='text-align: center; margin-top: 50px; opacity: 0.6;'><span style='font-size: 10px; color: #888888; letter-spacing: 1px; text-transform: uppercase;'>🔒 MEDALLION SECURE | MADE BY NISHIT</span></div>", unsafe_allow_html=True)
+    st.markdown("<div style='text-align: center; margin-top: 50px; opacity: 0.6;'><span style='font-size: 10px; color: #888888; letter-spacing: 1px;'>🔒 MEDALLION SECURE | made by nishit</span></div>", unsafe_allow_html=True)
 
 # Retrieve status from consolidated pipeline states
 status, last_success, last_file, error_msg, status_src, stage, duration = get_consolidated_status()
