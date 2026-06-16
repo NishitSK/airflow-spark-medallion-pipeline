@@ -3,13 +3,141 @@ import json
 import time
 import streamlit as st
 import random
+import glob
+import pandas as pd
+from datetime import datetime
 from pipeline.config import (
     BRONZE_PATH, SILVER_PATH, GOLD_PATH, TRACE_PATH, DQ_METRICS_PATH,
     METRICS_FILE, STATUS_FILE, INPUT_PATH, ARCHIVE_PATH, SAMPLES_PATH,
     HISTORY_FILE, QUARANTINE_PATH, PROFILE_PATH, DQ_REPORT_PATH, SCHEMA_MAP_LOG_PATH
 )
-from pipeline.delta_utils import get_spark_session
-import airflow_client
+try:
+    import airflow_client
+except ImportError:
+    try:
+        from dashboard import airflow_client
+    except ImportError:
+        import sys
+        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dashboard")
+        if db_path not in sys.path:
+            sys.path.append(db_path)
+        import airflow_client
+
+# --- Mock PySpark Column support to bypass SparkContext assert ---
+class MockColumn:
+    def __init__(self, name, ascending=True):
+        self.name = name
+        self.ascending = ascending
+    def desc(self):
+        return MockColumn(self.name, ascending=False)
+    def asc(self):
+        return MockColumn(self.name, ascending=True)
+    def __str__(self):
+        return f"{self.name} {'ASC' if self.ascending else 'DESC'}"
+
+def col(name):
+    return MockColumn(name)
+
+# --- Pandas Delta Table Reader ---
+def read_delta_pandas(path, columns=None):
+    """
+    Read Delta table (parquet files) using Pandas.
+    Handles missing directories or files gracefully.
+    """
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        files = glob.glob(os.path.join(path, "**/*.parquet"), recursive=True)
+        # Filter out delta log directory files
+        files = [f for f in files if "_delta_log" not in f]
+        if not files:
+            return pd.DataFrame()
+        # Read from path directory using Pandas read_parquet
+        return pd.read_parquet(path, columns=columns)
+    except Exception as e:
+        print(f"Error reading Delta path via Pandas: {path} - {e}")
+        return pd.DataFrame()
+
+# --- Delta log history parser in pure Python ---
+def get_delta_history_pandas(path):
+    log_dir = os.path.join(path, "_delta_log")
+    if not os.path.exists(log_dir):
+        return pd.DataFrame()
+        
+    records = []
+    try:
+        files = [f for f in os.listdir(log_dir) if f.endswith(".json")]
+        files.sort()
+        
+        for f in files:
+            version = int(f.split(".")[0])
+            f_path = os.path.join(log_dir, f)
+            with open(f_path, "r", encoding="utf-8") as file:
+                first_line = file.readline()
+                if first_line:
+                    try:
+                        data = json.loads(first_line)
+                        if "commitInfo" in data:
+                            info = data["commitInfo"]
+                            ts = info.get("timestamp", 0) / 1000.0
+                            records.append({
+                                "version": version,
+                                "timestamp": datetime.fromtimestamp(ts),
+                                "operation": info.get("operation", "UNKNOWN"),
+                                "operationMetrics": info.get("operationMetrics", {})
+                            })
+                    except Exception as json_err:
+                        pass
+    except Exception as e:
+        print(f"Error reading delta history: {e}")
+        
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df.sort_values("version", ascending=False, inplace=True)
+    return df
+
+# --- Spark DataFrame Mock Wrapper for caller compatibility ---
+class PandasDataFrameWrapper:
+    def __init__(self, df):
+        self.df = df
+
+    def count(self):
+        return len(self.df)
+
+    def limit(self, n):
+        return PandasDataFrameWrapper(self.df.head(n))
+
+    def orderBy(self, *cols):
+        by_cols = []
+        ascending = []
+        for c in cols:
+            if isinstance(c, MockColumn):
+                by_cols.append(c.name)
+                ascending.append(c.ascending)
+            else:
+                c_str = str(c)
+                if "DESC" in c_str.upper() or "DESCENDING" in c_str.upper():
+                    name = c_str.split()[0]
+                    by_cols.append(name)
+                    ascending.append(False)
+                else:
+                    by_cols.append(c_str)
+                    ascending.append(True)
+        try:
+            sorted_df = self.df.sort_values(by=by_cols, ascending=ascending)
+            return PandasDataFrameWrapper(sorted_df)
+        except Exception as e:
+            print(f"Error sorting wrapper df: {e}")
+            return self
+
+    def toPandas(self):
+        return self.df
+
+    def __getattr__(self, name):
+        return getattr(self.df, name)
+        
+    def __bool__(self):
+        return not self.df.empty
 
 # --- S3 Helper Functions ---
 def get_s3_export_metadata(run_id):
@@ -29,7 +157,7 @@ def get_s3_export_metadata(run_id):
     return metadata
 
 def get_s3_download_url(s3_key, expiry=3600):
-    """Generate a presigned URL for an S3 object."""
+    """Generate a presigned URL for an S3 object (legacy support)."""
     try:
         from utils.s3_client import generate_download_url
         return generate_download_url(s3_key, expiry)
@@ -37,29 +165,33 @@ def get_s3_download_url(s3_key, expiry=3600):
         print(f"Error generating presigned URL for {s3_key}: {e}")
         return None
 
-
-
+# --- Dashboard Query refactoring (SPARK-FREE) ---
 @st.cache_resource
 def get_spark():
-    return get_spark_session("Dashboard")
+    # Streamlit never creates a SparkSession
+    return None
 
 @st.cache_data(ttl=10)
-def get_kpis(_spark):
+def get_kpis(_spark=None):
     try:
         runtime_val = "0.00"
         if os.path.exists(METRICS_FILE):
             with open(METRICS_FILE) as f:
                 parts = f.read().strip().split(",")
-                if len(parts) >= 2: runtime_val = f"{float(parts[1]):.2f}"
+                if len(parts) >= 2: 
+                    runtime_val = f"{float(parts[1]):.2f}"
 
-        total_unique = _spark.read.format("delta").load(SILVER_PATH).count() if os.path.exists(SILVER_PATH) else 0
+        df = read_delta_pandas(SILVER_PATH, columns=["id"])
+        total_unique = df["id"].nunique() if not df.empty else 0
         return runtime_val, total_unique
-    except:
+    except Exception as e:
+        print(f"Error in get_kpis: {e}")
         return "0.00", 0
 
 def load_layer_data(spark, path):
-    if os.path.exists(path):
-        return spark.read.format("delta").load(path)
+    df = read_delta_pandas(path)
+    if not df.empty:
+        return PandasDataFrameWrapper(df)
     return None
 
 def convert_df_to_csv(df):
@@ -84,7 +216,6 @@ def get_last_uploaded_file():
 def get_consolidated_status(api_url=None, username=None, password=None):
     """
     Determines current status of pipeline using the orchestration client and filesystem state checks.
-    Returns (status, last_run_timestamp, last_file, error_message, source_method, stage, duration)
     """
     has_input_file = False
     input_file_name = None
@@ -108,12 +239,10 @@ def get_consolidated_status(api_url=None, username=None, password=None):
                 parts = f.read().strip().split(",")
                 if parts:
                     t_success = float(parts[0])
-                    from datetime import datetime
                     last_success_time = datetime.fromtimestamp(t_success).strftime("%Y-%m-%d %H:%M:%S")
         except:
             pass
 
-    # Read local status file to retrieve details if available
     local_stage = "Waiting"
     local_duration = "N/A"
     local_status = None
@@ -131,15 +260,12 @@ def get_consolidated_status(api_url=None, username=None, password=None):
         except:
             pass
 
-    # 1. Check Pipeline API
     try:
         latest_run, error = airflow_client.get_latest_run()
         if latest_run and not error:
             state = latest_run.get("state")
             run_date_str = latest_run.get("start_time")
-            # Map status to app status
             if state in ["running", "queued"]:
-                # If running, query local file for active stage if possible
                 active_stage = local_stage if local_status == "running" else "Bronze"
                 return "Pipeline running", last_success_time, last_file, None, f"Pipeline Service ({state})", active_stage, local_duration
             elif state == "failed":
@@ -147,7 +273,6 @@ def get_consolidated_status(api_url=None, username=None, password=None):
                 error_msg = f"Latest pipeline run '{run_date_str}' failed."
                 failed_stage = "Failed"
                 try:
-                    # Attempt to fetch task logs and extract exception
                     task_id, log_text = airflow_client.get_failed_task_log(run_id)
                     if log_text:
                         exc_type, exc_msg, stage_name = airflow_client.extract_exception_from_log(log_text)
@@ -159,14 +284,13 @@ def get_consolidated_status(api_url=None, username=None, password=None):
                         else:
                             error_msg += f" | Stage: {task_id or 'Failed'}"
                 except Exception as log_err:
-                    print(f"Error extracting task log exception: {log_err}")
+                    pass
                 return "Pipeline failed", last_success_time, last_file, error_msg, "Pipeline Service", failed_stage, local_duration
             elif state == "success":
                 return "Pipeline completed", last_success_time, last_file, None, "Pipeline Service", "Finished", local_duration
     except Exception:
         pass
 
-    # 2. Check local status file
     if local_status:
         file_name = local_file_name or last_file
         if local_status == "running":
@@ -174,7 +298,6 @@ def get_consolidated_status(api_url=None, username=None, password=None):
         elif local_status == "failed":
             error_msg = local_error or "Unknown local pipeline failure."
             if not error_msg.startswith("Exception: "):
-                # If there's a type: msg in local error, convert it
                 if ":" in error_msg and not error_msg.startswith("File "):
                     parts = error_msg.split(":", 1)
                     error_msg = f"Exception: {parts[0].strip()}: {parts[1].strip()}"
@@ -185,19 +308,13 @@ def get_consolidated_status(api_url=None, username=None, password=None):
         elif local_status == "completed":
             return "Pipeline completed", last_success_time, file_name, None, "Local Status", "Finished", local_duration
 
-    # 3. Infer from filesystem
     if last_success_time != "N/A":
         return "Pipeline completed", last_success_time, last_file, None, "Filesystem Inference", "Finished", local_duration
         
     return "Waiting for file", "N/A", last_file, None, "Filesystem Inference", "Waiting", "N/A"
 
 def generate_sample_datasets():
-    """
-    Generates three sample datasets (Small: 100 rows, Medium: 10,000 rows, Large: 100,000 rows)
-    in SAMPLES_PATH if they do not exist.
-    """
     import pandas as pd
-    
     os.makedirs(SAMPLES_PATH, exist_ok=True)
     
     small_path = os.path.join(SAMPLES_PATH, "small_sample.csv")
@@ -206,28 +323,22 @@ def generate_sample_datasets():
     small_json_path = os.path.join(SAMPLES_PATH, "small_sample.json")
     medium_json_path = os.path.join(SAMPLES_PATH, "medium_sample.json")
     
-    # Names lists to make mock data look realistic
     first_names = ["John", "Jane", "Alice", "Bob", "Charlie", "David", "Eva", "Frank", "Grace", "Henry"]
     last_names = ["Smith", "Jones", "Miller", "Davis", "Garcia", "Rodriguez", "Wilson", "Thomas", "Taylor", "Anderson"]
 
-    # Small: 100 rows (dirty data for testing DQ rules)
     if not os.path.exists(small_path):
         ids = list(range(1001, 1101))
         names = [f"{random.choice(first_names)} {random.choice(last_names)}" for _ in ids]
         ages = [random.randint(18, 75) for _ in ids]
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
-        # Use nullable integer to prevent cast to float due to None
         df["id"] = df["id"].astype("Int64")
         df["age"] = df["age"].astype("Int64")
-        # Inject DQ violation samples
-        df.loc[0, "id"] = pd.NA        # Null ID
-        df.loc[1, "age"] = -5        # Negative Age
-        df.loc[2, "age"] = 150       # Out-of-bounds Age
-        df.loc[3, "id"] = 1005       # Duplicate ID
+        df.loc[0, "id"] = pd.NA
+        df.loc[1, "age"] = -5
+        df.loc[2, "age"] = 150
+        df.loc[3, "id"] = 1005
         df.to_csv(small_path, index=False)
-        print("Generated small_sample.csv")
         
-    # Small JSON (100 rows, newline-delimited JSON)
     if not os.path.exists(small_json_path):
         ids = list(range(1101, 1201))
         names = [f"{random.choice(first_names)} {random.choice(last_names)}" for _ in ids]
@@ -235,13 +346,10 @@ def generate_sample_datasets():
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
         df["id"] = df["id"].astype("Int64")
         df["age"] = df["age"].astype("Int64")
-        # Inject DQ violation samples
         df.loc[0, "id"] = pd.NA
         df.loc[1, "age"] = -3
         df.to_json(small_json_path, orient="records", lines=True)
-        print("Generated small_sample.json")
         
-    # Medium: 10,000 rows (semi-clean, test spark scale)
     if not os.path.exists(medium_path):
         ids = list(range(2001, 12001))
         names = [f"User_{i}" for i in ids]
@@ -249,13 +357,10 @@ def generate_sample_datasets():
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
         df["id"] = df["id"].astype("Int64")
         df["age"] = df["age"].astype("Int64")
-        # Inject mild DQ issues
         df.loc[0, "id"] = pd.NA
         df.loc[1, "age"] = -1
         df.to_csv(medium_path, index=False)
-        print("Generated medium_sample.csv")
         
-    # Medium JSON (10,000 rows, newline-delimited JSON)
     if not os.path.exists(medium_json_path):
         ids = list(range(12001, 22001))
         names = [f"User_{i}" for i in ids]
@@ -263,13 +368,10 @@ def generate_sample_datasets():
         df = pd.DataFrame({"id": ids, "name": names, "age": ages})
         df["id"] = df["id"].astype("Int64")
         df["age"] = df["age"].astype("Int64")
-        # Inject DQ violation samples
         df.loc[0, "id"] = pd.NA
         df.loc[1, "age"] = -2
         df.to_json(medium_json_path, orient="records", lines=True)
-        print("Generated medium_sample.json")
         
-    # Large: 100,000 rows (clean data to show PySpark/Delta performance)
     if not os.path.exists(large_path):
         ids = list(range(12001, 112001))
         names = [f"User_{i}" for i in ids]
@@ -278,13 +380,8 @@ def generate_sample_datasets():
         df["id"] = df["id"].astype("Int64")
         df["age"] = df["age"].astype("Int64")
         df.to_csv(large_path, index=False)
-        print("Generated large_sample.csv")
-
 
 def get_file_metadata(filepath):
-    """
-    Returns (size_mb, row_count, col_count) for a CSV or JSON file.
-    """
     if not os.path.exists(filepath):
         return 0.0, 0, 0
     try:
@@ -294,17 +391,14 @@ def get_file_metadata(filepath):
         row_count = 0
         col_count = 0
         
-        # Count lines
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             for _ in f:
                 row_count += 1
                 
-        # Parse preview to get column count
         import pandas as pd
         if filepath.endswith('.csv'):
             if row_count > 0:
                 row_count -= 1
-            # Read header
             try:
                 df = pd.read_csv(filepath, nrows=1)
                 col_count = len(df.columns)
@@ -322,9 +416,6 @@ def get_file_metadata(filepath):
         return 0.0, 0, 0
 
 def get_file_preview(filepath):
-    """
-    Safely reads first 10 rows of a CSV or JSON file and returns a Pandas DataFrame.
-    """
     import pandas as pd
     if not os.path.exists(filepath):
         return None
@@ -338,15 +429,8 @@ def get_file_preview(filepath):
     return None
 
 @st.cache_data(ttl=10)
-def get_pipeline_history(_spark):
-    """
-    Retrieves the latest 20 pipeline run records.
-    Parses HISTORY_FILE (JSONL), falling back to Silver table Delta log history if empty.
-    """
-    import pandas as pd
+def get_pipeline_history(_spark=None):
     runs = []
-    
-    # 1. Try reading from persistent HISTORY_FILE
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r") as f:
@@ -356,15 +440,10 @@ def get_pipeline_history(_spark):
         except:
             pass
             
-    # 2. If no logs yet, fallback to querying Delta Lake log history
-    if not runs and _spark is not None:
+    if not runs:
         try:
-            from delta.tables import DeltaTable
-            if os.path.exists(SILVER_PATH):
-                dt_silver = DeltaTable.forPath(_spark, SILVER_PATH)
-                history_df = dt_silver.history().select("timestamp", "version", "operation", "operationMetrics").toPandas()
-                history_df.sort_values("version", ascending=False, inplace=True)
-                
+            history_df = get_delta_history_pandas(SILVER_PATH)
+            if not history_df.empty:
                 for idx, row in history_df.iterrows():
                     metrics = row["operationMetrics"] if row["operationMetrics"] else {}
                     rows = int(metrics.get('numOutputRows', 0)) if metrics.get('numOutputRows') else 0
@@ -378,19 +457,13 @@ def get_pipeline_history(_spark):
                         "rows": rows,
                         "error": None
                     })
-        except:
+        except Exception as e:
             pass
             
     runs.sort(key=lambda x: x.get("timestamp", 0.0), reverse=True)
     return runs[:20]
 
-def get_dq_audit_details(spark):
-    """
-    Analyzes Bronze table to find malformed records and duplicate key samples.
-    """
-    from pyspark.sql.functions import col, regexp_replace, trim, count
-    import pandas as pd
-    
+def get_dq_audit_details(spark=None):
     audit_data = {
         "malformed_ids": {"count": 0, "samples": []},
         "malformed_ages": {"count": 0, "samples": []},
@@ -401,42 +474,73 @@ def get_dq_audit_details(spark):
         if not os.path.exists(BRONZE_PATH):
             return audit_data
             
-        df = spark.read.format("delta").load(BRONZE_PATH)
-        total_rows = df.count()
+        df = read_delta_pandas(BRONZE_PATH, columns=["id", "name", "age"])
+        total_rows = len(df)
         if total_rows == 0:
             return audit_data
             
         # 1. Malformed IDs
-        cleaned_id = regexp_replace(trim(col("id")), r"\.0+$", "")
-        parsed_id = cleaned_id.cast("int")
-        is_malformed_id = parsed_id.isNull() & col("id").isNotNull() & (trim(col("id")) != "")
-        
-        malformed_ids_df = df.filter(is_malformed_id)
-        audit_data["malformed_ids"]["count"] = malformed_ids_df.count()
-        if audit_data["malformed_ids"]["count"] > 0:
-            samples = malformed_ids_df.select("id", "name").limit(5).collect()
-            audit_data["malformed_ids"]["samples"] = [{"id": r["id"], "name": r["name"]} for r in samples]
+        def to_int_safe(val):
+            try:
+                if pd.isnull(val): return None
+                s = str(val).strip()
+                if s == "": return None
+                # Strip trailing decimals for formatting (e.g. 1005.0)
+                if s.endswith(".0"):
+                    s = s[:-2]
+                return int(s)
+            except:
+                return None
+
+        # Detect malformed IDs
+        id_series = df["id"]
+        malformed_ids_mask = id_series.notnull() & (id_series.astype(str).str.strip() != "") & (id_series.apply(to_int_safe).isnull())
+        malformed_ids_df = df[malformed_ids_mask]
+        audit_data["malformed_ids"]["count"] = len(malformed_ids_df)
+        if len(malformed_ids_df) > 0:
+            samples = malformed_ids_df[["id", "name"]].head(5)
+            audit_data["malformed_ids"]["samples"] = samples.to_dict(orient="records")
             
-        # 2. Malformed Ages
-        cleaned_age = regexp_replace(trim(col("age")), r"\.0+$", "")
-        parsed_age = cleaned_age.cast("int")
-        is_malformed_age = parsed_age.isNull() & col("age").isNotNull() & (trim(col("age")) != "")
-        
-        malformed_ages_df = df.filter(is_malformed_age)
-        audit_data["malformed_ages"]["count"] = malformed_ages_df.count()
-        if audit_data["malformed_ages"]["count"] > 0:
-            samples = malformed_ages_df.select("age", "name").limit(5).collect()
-            audit_data["malformed_ages"]["samples"] = [{"age": r["age"], "name": r["name"]} for r in samples]
+        # 2. Malformed / Out-of-bounds Ages
+        def is_malformed_age_val(val):
+            try:
+                if pd.isnull(val): return False
+                s = str(val).strip()
+                if s == "": return False
+                if s.endswith(".0"):
+                    s = s[:-2]
+                v = int(s)
+                return v < 0 or v > 120
+            except:
+                return True
+
+        age_series = df["age"]
+        malformed_ages_mask = age_series.notnull() & (age_series.astype(str).str.strip() != "") & (age_series.apply(is_malformed_age_val))
+        malformed_ages_df = df[malformed_ages_mask]
+        audit_data["malformed_ages"]["count"] = len(malformed_ages_df)
+        if len(malformed_ages_df) > 0:
+            samples = malformed_ages_df[["age", "name"]].head(5)
+            audit_data["malformed_ages"]["samples"] = samples.to_dict(orient="records")
             
-        # 3. Duplicate IDs (duplicates on normalized ID)
-        normalized_df = df.withColumn("normalized_id", regexp_replace(trim(col("id")), r"\.0+$", ""))
-        # Filter keys with count > 1
-        dup_keys_df = normalized_df.groupBy("normalized_id").agg(count("*").alias("occurrences")).filter("occurrences > 1")
-        audit_data["duplicate_ids"]["count"] = dup_keys_df.count()
-        if audit_data["duplicate_ids"]["count"] > 0:
-            # Join back to get names and raw ids for duplicate samples
-            sample_dupes = normalized_df.join(dup_keys_df, "normalized_id").select("id", "name", "occurrences").limit(5).collect()
-            audit_data["duplicate_ids"]["samples"] = [{"raw_id": r["id"], "name": r["name"], "occurrences": r["occurrences"]} for r in sample_dupes]
+        # 3. Duplicate IDs (on normalized ID)
+        df["normalized_id"] = id_series.apply(lambda x: str(to_int_safe(x)) if to_int_safe(x) is not None else "")
+        valid_id_df = df[df["normalized_id"] != ""]
+        
+        dup_counts = valid_id_df["normalized_id"].value_counts()
+        dup_ids = dup_counts[dup_counts > 1].index.tolist()
+        
+        audit_data["duplicate_ids"]["count"] = len(dup_ids)
+        if len(dup_ids) > 0:
+            sample_df = valid_id_df[valid_id_df["normalized_id"].isin(dup_ids[:5])]
+            # Map columns
+            samples = []
+            for _, r in sample_df.iterrows():
+                samples.append({
+                    "raw_id": r["id"],
+                    "name": r["name"],
+                    "occurrences": dup_counts[r["normalized_id"]]
+                })
+            audit_data["duplicate_ids"]["samples"] = samples[:5]
             
     except Exception as e:
         print(f"Error fetching DQ audit details: {str(e)}")
@@ -444,34 +548,24 @@ def get_dq_audit_details(spark):
     return audit_data
 
 @st.cache_data(ttl=10)
-def get_dq_trends(_spark):
-    """
-    Retrieves all history validation metrics from DQ_METRICS_PATH.
-    """
-    from pyspark.sql.functions import col
-    import pandas as pd
+def get_dq_trends(_spark=None):
     import numpy as np
-    
     try:
-        if os.path.exists(DQ_METRICS_PATH) and _spark is not None:
-            df = _spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").asc()).toPandas()
+        if os.path.exists(DQ_METRICS_PATH):
+            df = read_delta_pandas(DQ_METRICS_PATH)
             if not df.empty:
-                # Replace 0 total_rows with NaN to prevent divide-by-zero
+                df = df.sort_values("validation_time", ascending=True)
                 total = df['total_rows'].replace(0, np.nan)
                 
-                # Metrics percentage calculations
                 df['Null Rate (%)'] = (df['null_ids'] / total * 100).fillna(0.0)
                 df['Duplicate Rate (%)'] = (df['duplicate_ids'] / total * 100).fillna(0.0)
                 df['Invalid Age Rate (%)'] = (df['invalid_ages'] / total * 100).fillna(0.0)
                 
-                # Quality Score = (Passed Rows / Total Rows) * 100
-                # Passed Rows = Total - (nulls + invalid age + duplicates)
                 failed_records = df['null_ids'] + df['invalid_ages'] + df['duplicate_ids']
                 passed_records = (df['total_rows'] - failed_records).clip(lower=0)
                 df['Quality Score (%)'] = (passed_records / total * 100).fillna(100.0)
                 df['Failure Rate (%)'] = (failed_records / total * 100).fillna(0.0)
                 
-                # Formatting validation time
                 df['Timestamp'] = pd.to_datetime(df['validation_time']).dt.strftime('%m-%d %H:%M:%S')
                 return df
     except Exception as e:
@@ -479,33 +573,19 @@ def get_dq_trends(_spark):
     return pd.DataFrame()
 
 @st.cache_data(ttl=10)
-def get_incidents(_spark):
-    """
-    Retrieves logged incidents and execution traces from TRACE_PATH.
-    """
-    from pyspark.sql.functions import col
-    import pandas as pd
-    
+def get_incidents(_spark=None):
     try:
-        if os.path.exists(TRACE_PATH) and _spark is not None:
-            df = _spark.read.format("delta").load(TRACE_PATH)
-            incidents_df = df.orderBy(col("timestamp").desc()).limit(20).toPandas()
-            return incidents_df
+        if os.path.exists(TRACE_PATH):
+            df = read_delta_pandas(TRACE_PATH)
+            if not df.empty:
+                df = df.sort_values("timestamp", ascending=False).head(20)
+                return df
     except Exception as e:
         print(f"Error fetching incidents: {str(e)}")
     return pd.DataFrame()
 
 @st.cache_data(ttl=10)
-def get_last_run_summary(_spark):
-    """
-    Fetches details of the last completed or failed run for the summary card.
-    Returns a dict with status, start_time, end_time, duration, rows_processed, dq_score.
-    """
-    import os
-    import json
-    import pandas as pd
-    from pipeline.config import HISTORY_FILE, DQ_METRICS_PATH
-    
+def get_last_run_summary(_spark=None):
     summary = {
         "status": "N/A",
         "start_time": "N/A",
@@ -515,7 +595,6 @@ def get_last_run_summary(_spark):
         "dq_score": "N/A"
     }
     
-    # 1. Fetch latest record from history
     last_record = None
     if os.path.exists(HISTORY_FILE):
         try:
@@ -547,10 +626,8 @@ def get_last_run_summary(_spark):
         rows_val = last_record.get("rows", 0)
         summary["rows"] = f"{rows_val:,}" if isinstance(rows_val, (int, float)) else str(rows_val)
         
-        # Estimate start and end times
         timestamp = last_record.get("timestamp")
         if timestamp:
-            from datetime import datetime
             dt_end = datetime.fromtimestamp(timestamp)
             summary["end_time"] = dt_end.strftime("%Y-%m-%d %H:%M:%S")
             
@@ -561,13 +638,12 @@ def get_last_run_summary(_spark):
             except:
                 summary["start_time"] = summary["end_time"]
                 
-    # 2. Fetch last DQ Score
     try:
-        if os.path.exists(DQ_METRICS_PATH) and _spark is not None:
-            from pyspark.sql.functions import col
-            dq_df = _spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").desc()).limit(1).toPandas()
+        if os.path.exists(DQ_METRICS_PATH):
+            dq_df = read_delta_pandas(DQ_METRICS_PATH)
             if not dq_df.empty:
-                row = dq_df.iloc[0]
+                # Latest row
+                row = dq_df.sort_values("validation_time", ascending=False).iloc[0]
                 total_val = int(row["total_rows"])
                 failed = int(row["null_ids"]) + int(row["invalid_ages"]) + int(row["duplicate_ids"])
                 passed = max(0, total_val - failed)
@@ -579,16 +655,7 @@ def get_last_run_summary(_spark):
     return summary
 
 
-def get_gold_report_data(spark):
-    """
-    Retrieves consolidated metrics and summary datasets from all lakehouse layers
-    associated with the latest successful run.
-    """
-    import os
-    import json
-    import pandas as pd
-    from datetime import datetime
-    
+def get_gold_report_data(spark=None, bronze_count=None, silver_count=None, gold_df=None):
     report_data = {
         "status": "N/A",
         "run_id": "N/A",
@@ -605,7 +672,6 @@ def get_gold_report_data(spark):
         "gold_summary": None
     }
     
-    # 1. Fetch latest record from history
     last_record = None
     if os.path.exists(HISTORY_FILE):
         try:
@@ -637,30 +703,31 @@ def get_gold_report_data(spark):
     if ts:
         report_data["timestamp"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
         
-    # 2. Get rows received (Bronze count)
-    try:
-        if os.path.exists(BRONZE_PATH) and spark is not None:
-            report_data["rows_received"] = spark.read.format("delta").load(BRONZE_PATH).count()
-    except Exception as e:
-        print(f"Error fetching bronze count for report: {e}")
-        
-    # 3. Get rows processed (Silver count)
-    try:
-        if os.path.exists(SILVER_PATH) and spark is not None:
-            report_data["rows_processed"] = spark.read.format("delta").load(SILVER_PATH).count()
-    except Exception as e:
-        print(f"Error fetching silver count for report: {e}")
-        
-    # Calculate rows rejected
+    if bronze_count is not None:
+        report_data["rows_received"] = bronze_count
+    else:
+        try:
+            if os.path.exists(BRONZE_PATH):
+                report_data["rows_received"] = len(read_delta_pandas(BRONZE_PATH, columns=["id"]))
+        except Exception as e:
+            print(f"Error fetching bronze count for report: {e}")
+            
+    if silver_count is not None:
+        report_data["rows_processed"] = silver_count
+    else:
+        try:
+            if os.path.exists(SILVER_PATH):
+                report_data["rows_processed"] = len(read_delta_pandas(SILVER_PATH, columns=["id"]))
+        except Exception as e:
+            print(f"Error fetching silver count for report: {e}")
+            
     report_data["rows_rejected"] = max(0, report_data["rows_received"] - report_data["rows_processed"])
     
-    # 4. Fetch latest DQ Score & metrics
     try:
-        if os.path.exists(DQ_METRICS_PATH) and spark is not None:
-            from pyspark.sql.functions import col
-            dq_df = spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").desc()).limit(1).toPandas()
+        if os.path.exists(DQ_METRICS_PATH):
+            dq_df = read_delta_pandas(DQ_METRICS_PATH)
             if not dq_df.empty:
-                row = dq_df.iloc[0]
+                row = dq_df.sort_values("validation_time", ascending=False).iloc[0]
                 total_val = int(row["total_rows"])
                 null_ids = int(row.get("null_ids", 0))
                 invalid_ages = int(row.get("invalid_ages", 0))
@@ -677,22 +744,21 @@ def get_gold_report_data(spark):
     except Exception as e:
         print(f"Error fetching DQ metrics for report: {e}")
         
-    # 5. Fetch Gold Layer metrics summary
-    try:
-        if os.path.exists(GOLD_PATH) and spark is not None:
-            gold_df = spark.read.format("delta").load(GOLD_PATH).toPandas()
-            if not gold_df.empty:
-                report_data["gold_summary"] = gold_df
-    except Exception as e:
-        print(f"Error fetching gold summary for report: {e}")
-        
+    if gold_df is not None:
+        report_data["gold_summary"] = gold_df
+    else:
+        try:
+            if os.path.exists(GOLD_PATH):
+                gold_df_read = read_delta_pandas(GOLD_PATH)
+                if not gold_df_read.empty:
+                    report_data["gold_summary"] = gold_df_read
+        except Exception as e:
+            print(f"Error fetching gold summary for report: {e}")
+            
     return report_data
 
 
 def generate_txt_report(data):
-    """
-    Formulates a clean structured TXT report.
-    """
     if not data:
         return "No report data available."
         
@@ -735,9 +801,6 @@ def generate_txt_report(data):
 
 
 def generate_pdf_report(data):
-    """
-    Generates a structured PDF document report using fpdf2 and returns its bytes.
-    """
     if not data:
         return b""
         
@@ -763,7 +826,6 @@ def generate_pdf_report(data):
     pdf.add_page()
     pdf.set_font("Helvetica", size=10)
     
-    # Metadata section
     pdf.set_font("Helvetica", "B", 12)
     pdf.cell(0, 8, "Execution Metadata", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", size=10)
@@ -777,7 +839,6 @@ def generate_pdf_report(data):
     pdf.cell(0, 6, str(data.get("runtime")), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
     
-    # Data Processing Stats section
     pdf.set_font("Helvetica", "B", 12)
     pdf.cell(0, 8, "Data Ingestion & Processing Stats", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", size=10)
@@ -789,7 +850,6 @@ def generate_pdf_report(data):
     pdf.cell(0, 6, f"{data.get('rows_rejected'):,}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
     
-    # Data Quality Score section
     pdf.set_font("Helvetica", "B", 12)
     pdf.cell(0, 8, "Data Quality & Audit Rules", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", size=10)
@@ -803,14 +863,12 @@ def generate_pdf_report(data):
     pdf.cell(0, 6, f"{data.get('invalid_ages'):,}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
     
-    # Gold layer summary table
     pdf.set_font("Helvetica", "B", 12)
     pdf.cell(0, 8, "Gold Layer Metrics Summary", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(2)
     
     gold_df = data.get("gold_summary")
     if gold_df is not None and not gold_df.empty:
-        # Table Header
         pdf.set_font("Helvetica", "B", 10)
         pdf.cell(60, 8, "Processed Date", border=1, align="C", new_x="RIGHT")
         pdf.cell(60, 8, "Average Age", border=1, align="C", new_x="RIGHT")
@@ -829,9 +887,7 @@ def generate_pdf_report(data):
         pdf.set_font("Helvetica", "I", 10)
         pdf.cell(0, 6, "No Gold metrics summary aggregated.", new_x="LMARGIN", new_y="NEXT")
         
-    # Atomic export with NamedTemporaryFile to ensure safety
     import tempfile
-    import os
     pdf_bytes = b""
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -854,90 +910,78 @@ def generate_pdf_report(data):
 # ============================================================
 
 @st.cache_data(ttl=30)
-def get_quarantine_data(_spark, run_id: str = None):
-    """
-    Retrieve quarantined rows from the quarantine Delta table.
-    If run_id is provided, filters to that specific run.
-    Returns a Pandas DataFrame or empty DataFrame.
-    """
-    import pandas as pd
+def get_quarantine_data(_spark=None, run_id: str = None):
     try:
-        if not os.path.exists(QUARANTINE_PATH) or _spark is None:
+        if not os.path.exists(QUARANTINE_PATH):
             return pd.DataFrame()
-        df = _spark.read.format("delta").load(QUARANTINE_PATH)
+        df = read_delta_pandas(QUARANTINE_PATH)
+        if df.empty:
+            return pd.DataFrame()
         if run_id:
-            df = df.filter(df.run_id == run_id)
-        from pyspark.sql.functions import col as _col
-        result = df.orderBy(_col("quarantine_time").desc()).limit(500).toPandas()
-        return result
+            df = df[df["run_id"] == run_id]
+        if not df.empty and "quarantine_time" in df.columns:
+            df = df.sort_values("quarantine_time", ascending=False).head(500)
+        return df
     except Exception as e:
         print(f"Error fetching quarantine data: {e}")
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=30)
-def get_profile_data(_spark, run_id: str = None):
-    """
-    Retrieve column profiling results from the data_profile Delta table.
-    Returns a Pandas DataFrame.
-    """
-    import pandas as pd
+def get_profile_data(_spark=None, run_id: str = None):
     try:
-        if not os.path.exists(PROFILE_PATH) or _spark is None:
+        if not os.path.exists(PROFILE_PATH):
             return pd.DataFrame()
-        df = _spark.read.format("delta").load(PROFILE_PATH)
+        df = read_delta_pandas(PROFILE_PATH)
+        if df.empty:
+            return pd.DataFrame()
         if run_id:
-            df = df.filter(df.run_id == run_id)
+            df = df[df["run_id"] == run_id]
         else:
-            from pyspark.sql.functions import col as _col
-            latest = df.orderBy(_col("profile_time").desc()).limit(1).collect()
-            if latest:
-                latest_run = latest[0]["run_id"]
-                df = df.filter(df.run_id == latest_run)
-        return df.toPandas()
+            if "profile_time" in df.columns and "run_id" in df.columns:
+                latest_runs = df.sort_values("profile_time", ascending=False)
+                if not latest_runs.empty:
+                    latest_run = latest_runs.iloc[0]["run_id"]
+                    df = df[df["run_id"] == latest_run]
+        return df
     except Exception as e:
         print(f"Error fetching profile data: {e}")
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=30)
-def get_dq_run_report(_spark, run_id: str = None):
-    """
-    Retrieve the DQ run report scorecard from the dq_run_report Delta table.
-    Returns a dict with the latest run's metrics.
-    """
-    import pandas as pd
+def get_dq_run_report(_spark=None, run_id: str = None):
     try:
-        if not os.path.exists(DQ_REPORT_PATH) or _spark is None:
+        if not os.path.exists(DQ_REPORT_PATH):
             return None
-        from pyspark.sql.functions import col as _col
-        df = _spark.read.format("delta").load(DQ_REPORT_PATH)
+        df = read_delta_pandas(DQ_REPORT_PATH)
+        if df.empty:
+            return None
         if run_id:
-            df = df.filter(df.run_id == run_id)
-        order_col = "report_time" if "report_time" in df.columns else "processed_at"
-        latest = df.orderBy(_col(order_col).desc()).limit(1).toPandas()
-        if latest.empty:
-            return None
-        return latest.iloc[0].to_dict()
+            df = df[df["run_id"] == run_id]
+        
+        order_col = "report_time" if "report_time" in df.columns else ("processed_at" if "processed_at" in df.columns else None)
+        if order_col:
+            df = df.sort_values(order_col, ascending=False)
+        return df.iloc[0].to_dict()
     except Exception as e:
         print(f"Error fetching DQ run report: {e}")
         return None
 
 
 @st.cache_data(ttl=60)
-def get_schema_mapping_log(_spark, run_id: str = None):
-    """
-    Retrieve schema mapping log entries from the schema_mapping_log Delta table.
-    Returns a Pandas DataFrame.
-    """
-    import pandas as pd
+def get_schema_mapping_log(_spark=None, run_id: str = None):
     try:
-        if not os.path.exists(SCHEMA_MAP_LOG_PATH) or _spark is None:
+        if not os.path.exists(SCHEMA_MAP_LOG_PATH):
             return pd.DataFrame()
-        df = _spark.read.format("delta").load(SCHEMA_MAP_LOG_PATH)
+        df = read_delta_pandas(SCHEMA_MAP_LOG_PATH)
+        if df.empty:
+            return pd.DataFrame()
         if run_id:
-            df = df.filter(df.run_id == run_id)
-        return df.orderBy(df.mapping_time.desc()).limit(20).toPandas()
+            df = df[df["run_id"] == run_id]
+        if "mapping_time" in df.columns:
+            df = df.sort_values("mapping_time", ascending=False).head(20)
+        return df
     except Exception as e:
         print(f"Error fetching schema mapping log: {e}")
         return pd.DataFrame()

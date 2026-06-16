@@ -778,24 +778,40 @@ if page == "Pipeline Dashboard":
         txt_report = generate_txt_report(report_data)
         pdf_bytes = generate_pdf_report(report_data)
         
-        # Get S3 Metadata and presigned URLs
-        from queries import get_s3_export_metadata, get_s3_download_url
+        # Get S3 Metadata and direct downloads
+        from queries import get_s3_export_metadata
+        from utils.s3_client import object_exists, download_object_bytes
+        
         s3_meta = get_s3_export_metadata(run_id)
         
-        url_cleaned = get_s3_download_url(f"exports/{run_id}/cleaned_dataset.csv")
-        url_rejected = get_s3_download_url(f"quarantine/{run_id}/rejected_records.csv")
-        url_report = get_s3_download_url(f"reports/{run_id}/gold_report.txt")
+        # Check S3 presence and fetch bytes
+        s3_active = object_exists(f"exports/{run_id}/cleaned_dataset.csv")
+        s3_csv_bytes = None
+        s3_report_bytes = None
+        s3_rejected_bytes = None
+        
+        if s3_active:
+            s3_csv_bytes = download_object_bytes(f"exports/{run_id}/cleaned_dataset.csv")
+            s3_report_bytes = download_object_bytes(f"reports/{run_id}/gold_report.txt")
+            s3_rejected_bytes = download_object_bytes(f"quarantine/{run_id}/rejected_records.csv")
         
         col_actions, col_report = st.columns([1, 2])
         
         with col_actions:
             st.markdown("##### ☁️ S3 Storage")
-            if url_cleaned or url_rejected or url_report:
+            if s3_active:
                 st.success("S3 Integration Active")
                 
                 # 📥 Download Cleaned Dataset
-                if url_cleaned:
-                    st.markdown(f'<a href="{url_cleaned}" target="_blank"><button style="width:100%; border-radius:5px; padding:10px; background-color:#1E1E1E; color:white; border:1px solid #333; margin-bottom:10px;">📥 S3 Download: Cleaned Dataset</button></a>', unsafe_allow_html=True)
+                if s3_csv_bytes:
+                    st.download_button(
+                        label="📥 S3 Download: Cleaned Dataset",
+                        data=s3_csv_bytes,
+                        file_name=f"cleaned_dataset_{run_id}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"s3_down_csv_{run_id}"
+                    )
                 elif csv_bytes:
                     st.download_button(
                         label="📥 Local Download: Cleaned Dataset",
@@ -803,13 +819,21 @@ if page == "Pipeline Dashboard":
                         file_name=f"cleaned_dataset_{run_id}.csv",
                         mime="text/csv",
                         use_container_width=True,
+                        key=f"local_down_csv_{run_id}"
                     )
                 else:
                     st.button("📥 Download Cleaned Dataset", disabled=True, use_container_width=True)
                 
                 # 📄 Download Report (TXT)
-                if url_report:
-                     st.markdown(f'<a href="{url_report}" target="_blank"><button style="width:100%; border-radius:5px; padding:10px; background-color:#1E1E1E; color:white; border:1px solid #333; margin-bottom:10px;">📄 S3 Download: Report (TXT)</button></a>', unsafe_allow_html=True)
+                if s3_report_bytes:
+                    st.download_button(
+                        label="📄 S3 Download: Report (TXT)",
+                        data=s3_report_bytes,
+                        file_name=f"gold_analytics_report_{run_id}.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                        key=f"s3_down_txt_{run_id}"
+                    )
                 else:
                     st.download_button(
                         label="📄 Local Download: Report (TXT)",
@@ -817,6 +841,7 @@ if page == "Pipeline Dashboard":
                         file_name=f"gold_analytics_report_{run_id}.txt",
                         mime="text/plain",
                         use_container_width=True,
+                        key=f"local_down_txt_{run_id}"
                     )
                 
                 # ⬇️ Download Rejected Records
@@ -826,19 +851,27 @@ if page == "Pipeline Dashboard":
                 except:
                     has_rejects = False
                     
-                if url_rejected:
-                     st.markdown(f'<a href="{url_rejected}" target="_blank"><button style="width:100%; border-radius:5px; padding:10px; background-color:#1E1E1E; color:white; border:1px solid #333; margin-bottom:10px;">⬇️ S3 Download: Rejected Records</button></a>', unsafe_allow_html=True)
+                if s3_rejected_bytes:
+                    st.download_button(
+                        label="⬇️ S3 Download: Rejected Records",
+                        data=s3_rejected_bytes,
+                        file_name=f"rejected_records_{run_id}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"s3_down_rej_{run_id}"
+                    )
                 elif has_rejects:
-                     rejected_bytes = q_df_output.to_csv(index=False).encode("utf-8")
-                     st.download_button(
+                    rejected_bytes = q_df_output.to_csv(index=False).encode("utf-8")
+                    st.download_button(
                         label=f"⬇️ Local Download: Rejected Records ({len(q_df_output)})",
                         data=rejected_bytes,
                         file_name=f"rejected_records_{run_id}.csv",
                         mime="text/csv",
                         use_container_width=True,
-                     )
+                        key=f"local_down_rej_{run_id}"
+                    )
                 else:
-                     st.success("✅ No rejected records")
+                    st.success("✅ No rejected records")
 
                 st.markdown("---")
                 
@@ -853,15 +886,15 @@ if page == "Pipeline Dashboard":
                 st.warning("S3 Integration Offline")
                 # Fallback to local
                 if csv_bytes:
-                    st.download_button(label="📥 Download Cleaned Dataset", data=csv_bytes, file_name=f"cleaned_dataset_{run_id}.csv", mime="text/csv", use_container_width=True)
-                st.download_button(label="📄 Download Report (TXT)", data=txt_report, file_name=f"gold_analytics_report_{run_id}.txt", mime="text/plain", use_container_width=True)
+                    st.download_button(label="📥 Download Cleaned Dataset", data=csv_bytes, file_name=f"cleaned_dataset_{run_id}.csv", mime="text/csv", use_container_width=True, key=f"offline_down_csv_{run_id}")
+                st.download_button(label="📄 Download Report (TXT)", data=txt_report, file_name=f"gold_analytics_report_{run_id}.txt", mime="text/plain", use_container_width=True, key=f"offline_down_txt_{run_id}")
                 if pdf_bytes:
-                    st.download_button(label="📄 Download Report (PDF)", data=pdf_bytes, file_name=f"gold_analytics_report_{run_id}.pdf", mime="application/pdf", use_container_width=True)
+                    st.download_button(label="📄 Download Report (PDF)", data=pdf_bytes, file_name=f"gold_analytics_report_{run_id}.pdf", mime="application/pdf", use_container_width=True, key=f"offline_down_pdf_{run_id}")
                 try:
                     q_df_output = get_quarantine_data(spark, run_id=run_id)
                     if not q_df_output.empty:
                         rejected_bytes = q_df_output.to_csv(index=False).encode("utf-8")
-                        st.download_button(label=f"⬇️ Download Rejected Records ({len(q_df_output)})", data=rejected_bytes, file_name=f"rejected_records_{run_id}.csv", mime="text/csv", use_container_width=True)
+                        st.download_button(label=f"⬇️ Download Rejected Records ({len(q_df_output)})", data=rejected_bytes, file_name=f"rejected_records_{run_id}.csv", mime="text/csv", use_container_width=True, key=f"offline_down_rej_{run_id}")
                     else:
                         st.success("✅ No rejected records")
                 except:
@@ -887,7 +920,7 @@ if page == "Pipeline Dashboard":
             st.subheader("Raw Ingest Inbound Log")
             df = load_layer_data(spark, BRONZE_PATH)
             if df is not None:
-                from pyspark.sql.functions import col
+                from queries import col
                 total_raw = df.count()
                 st.metric("Total Ingested Records", f"{total_raw:,}")
                 sorted_df = df.orderBy(col("ingestion_time").desc()).limit(100).toPandas()
@@ -898,7 +931,7 @@ if page == "Pipeline Dashboard":
     with tabs[1]:
         df = load_layer_data(spark, SILVER_PATH)
         if df is not None:
-            from pyspark.sql.functions import col
+            from queries import col
             df_sorted = df.orderBy(col("processed_date").desc(), col("id"))
             full_pdf = df_sorted.toPandas()
             total_cleaned = len(full_pdf)
@@ -1076,14 +1109,12 @@ if page == "Pipeline Dashboard":
         st.success("✅ No records were quarantined in the latest successful run.")
 
 elif page == "Delta Lake Transaction Log":
-    from delta.tables import DeltaTable
-    
     st.title("🛡️ Delta Lake Transaction Log")
     st.write("Dynamic execution history retrieved directly from Delta Lake metadata logs.")
     
     try:
-        dt_silver = DeltaTable.forPath(spark, SILVER_PATH)
-        history_df = dt_silver.history().select("version", "timestamp", "operation", "operationMetrics").toPandas()
+        from queries import get_delta_history_pandas
+        history_df = get_delta_history_pandas(SILVER_PATH)
         
         history_df.sort_values("version", ascending=False, inplace=True)
         
@@ -1117,22 +1148,27 @@ elif page == "Delta Lake Transaction Log":
         st.error(f"Error loading Delta history: {str(e)}")
 
 elif page == "Data Quality & Observability":
-    from delta.tables import DeltaTable
-    from pyspark.sql.functions import col
+    from queries import col, read_delta_pandas
     
     st.title("🛡️ Data Quality & Observability Portal")
     st.write("Comprehensive metrics, lineages, and audit trails generated from your Lakehouse layers.")
     
     # Calculate counts
-    bronze_cnt = spark.read.format("delta").load(BRONZE_PATH).count() if os.path.exists(BRONZE_PATH) else 0
-    silver_cnt = spark.read.format("delta").load(SILVER_PATH).count() if os.path.exists(SILVER_PATH) else 0
-    gold_cnt = spark.read.format("delta").load(GOLD_PATH).count() if os.path.exists(GOLD_PATH) else 0
+    bronze_df = read_delta_pandas(BRONZE_PATH, columns=["id"])
+    silver_df = read_delta_pandas(SILVER_PATH, columns=["id"])
+    gold_df = read_delta_pandas(GOLD_PATH, columns=["processed_date"])
+    bronze_cnt = len(bronze_df) if not bronze_df.empty else 0
+    silver_cnt = len(silver_df) if not silver_df.empty else 0
+    gold_cnt = len(gold_df) if not gold_df.empty else 0
     
     # Fetch latest validation metrics from dq_metrics path
     latest_dq = None
     try:
         if os.path.exists(DQ_METRICS_PATH):
-            dq_df = spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").desc()).limit(1).toPandas()
+            dq_df = read_delta_pandas(DQ_METRICS_PATH)
+            if not dq_df.empty:
+                dq_df = dq_df.sort_values("validation_time", ascending=False).head(1)
+                latest_dq = dq_df.iloc[0]
             if not dq_df.empty:
                 latest_dq = dq_df.iloc[0]
     except Exception as e:

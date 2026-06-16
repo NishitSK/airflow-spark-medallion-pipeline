@@ -10,7 +10,7 @@ from pipeline.config import QUARANTINE_PATH
 from pipeline.delta_utils import write_delta
 
 
-def write_quarantine(invalid_df: DataFrame, run_id: str = "unknown", source_file: str = "unknown"):
+def write_quarantine(invalid_df: DataFrame, run_id: str = "unknown", source_file: str = "unknown", row_count: int = None):
     """
     Append rejected rows to the quarantine Delta table.
     invalid_df must already contain: quarantine_reason, rule_violated, run_id, dq_source_file
@@ -19,7 +19,8 @@ def write_quarantine(invalid_df: DataFrame, run_id: str = "unknown", source_file
         return 0
 
     try:
-        row_count = invalid_df.count()
+        if row_count is None:
+            row_count = invalid_df.count()
         if row_count == 0:
             print("[Quarantine] No invalid rows to quarantine.")
             return 0

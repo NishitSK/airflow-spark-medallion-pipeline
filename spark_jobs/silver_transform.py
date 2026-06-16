@@ -28,7 +28,7 @@ def _load_config():
     return {}
 
 
-def transform_silver(spark=None, valid_df: DataFrame = None):
+def transform_silver(spark=None, valid_df: DataFrame = None, row_count: int = None):
     """
     Transform valid rows into Silver layer.
     If valid_df is provided (from DQ engine), use it directly.
@@ -49,7 +49,7 @@ def transform_silver(spark=None, valid_df: DataFrame = None):
         else:
             if not os.path.exists(BRONZE_PATH):
                 print("[Silver] Bronze path does not exist. Skipping.")
-                return
+                return 0, None
             bronze_df = read_delta(spark, BRONZE_PATH)
 
         config = _load_config()
@@ -81,14 +81,15 @@ def transform_silver(spark=None, valid_df: DataFrame = None):
         # Add processed_date partition column
         final_df = final_df.withColumn("processed_date", to_date("ingestion_time"))
 
-        row_count = final_df.count()
+        if row_count is None:
+            row_count = final_df.count()
         if row_count > 0:
             write_delta(final_df, SILVER_PATH, mode="overwrite", partition_by="processed_date")
             print(f"[Silver] Transformation Success: {row_count} rows written.")
         else:
             print("[Silver] No valid rows to write to Silver.")
 
-        return row_count
+        return row_count, (final_df if row_count > 0 else None)
 
     except Exception as e:
         print(f"[Silver] Transformation Failed: {str(e)}")

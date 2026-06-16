@@ -124,18 +124,30 @@ def run_dq_engine(df: DataFrame, run_id: str = "unknown", source_file: str = "un
         .drop(*[c for c in internal_cols if c not in ("__violations",)]) \
         .drop("__violations")
 
-    # ---- Scorecard ----
-    total        = df.count()
-    valid_count  = valid_df.count()
-    invalid_count = invalid_df.count()
-    dq_score     = (valid_count / total * 100) if total > 0 else 100.0
+    # ---- Scorecard (Consolidated Single Aggregation Pass) ----
+    tagged_df = tagged_df.cache()
+    metrics = tagged_df.select(
+        F.count("*").alias("total"),
+        F.sum(F.when(col("__has_critical_violation"), 1).otherwise(0)).alias("invalid_count"),
+        F.sum(F.when(is_null_id, 1).otherwise(0)).alias("null_ids_count"),
+        F.sum(F.when(is_malformed_id, 1).otherwise(0)).alias("malformed_id_count"),
+        F.sum(F.when(is_invalid_age, 1).otherwise(0)).alias("invalid_age_count"),
+        F.sum(F.when(is_null_age, 1).otherwise(0)).alias("null_age_count"),
+        F.sum(F.when(is_null_name, 1).otherwise(0)).alias("null_name_count"),
+        F.sum(F.when(col("__is_duplicate") == True, 1).otherwise(0)).alias("dup_count")
+    ).collect()[0]
 
-    null_ids_count     = df.filter(is_null_id).count()
-    malformed_id_count = df.filter(is_malformed_id).count()
-    invalid_age_count  = df.filter(is_invalid_age).count()
-    null_age_count     = df.filter(is_null_age).count()
-    null_name_count    = df.filter(is_null_name).count()
-    dup_count          = tagged_df.filter(col("__is_duplicate")).count()
+    total = metrics["total"] or 0
+    invalid_count = metrics["invalid_count"] or 0
+    valid_count = total - invalid_count
+    dq_score = (valid_count / total * 100) if total > 0 else 100.0
+
+    null_ids_count = metrics["null_ids_count"] or 0
+    malformed_id_count = metrics["malformed_id_count"] or 0
+    invalid_age_count = metrics["invalid_age_count"] or 0
+    null_age_count = metrics["null_age_count"] or 0
+    null_name_count = metrics["null_name_count"] or 0
+    dup_count = metrics["dup_count"] or 0
 
     scorecard = {
         "run_id":          run_id,

@@ -20,67 +20,86 @@ def profile_dataframe(df: DataFrame, run_id: str, source_file: str, spark: Spark
     """
     profile_records = []
     anomalies = []
+    
     total_rows = df.count()
+    if total_rows == 0:
+        return [], [], 0
 
-    numeric_cols = [f.name for f in df.schema.fields if str(f.dataType) in ("IntegerType()", "LongType()", "DoubleType()", "FloatType()")]
-    string_cols  = [f.name for f in df.schema.fields if str(f.dataType) == "StringType()"]
+    columns_to_profile = [c for c in df.columns if c not in ("ingestion_time", "source_file")]
 
-    for col_name in df.columns:
-        if col_name in ("ingestion_time", "source_file"):
-            continue
+    # 1. Single aggregation pass for all standard stats
+    agg_exprs = []
+    for c in columns_to_profile:
+        # Null count
+        agg_exprs.append(F.sum(F.when(col(c).isNull() | (F.trim(col(c)) == ""), 1).otherwise(0)).alias(f"null_cnt_{c}"))
+        # Distinct count
+        agg_exprs.append(F.countDistinct(col(c)).alias(f"distinct_cnt_{c}"))
+        # Numeric stats (cast to double)
+        num_col = col(c).cast("double")
+        agg_exprs.append(F.min(num_col).alias(f"min_{c}"))
+        agg_exprs.append(F.max(num_col).alias(f"max_{c}"))
+        agg_exprs.append(F.avg(num_col).alias(f"avg_{c}"))
+        agg_exprs.append(F.stddev(num_col).alias(f"stddev_{c}"))
 
-        null_count = df.filter(col(col_name).isNull()).count()
-        null_pct   = round(null_count / total_rows * 100, 2) if total_rows > 0 else 0.0
+    stats_row = df.agg(*agg_exprs).collect()[0]
 
-        distinct_count = df.select(col_name).distinct().count()
-        dup_count  = total_rows - distinct_count
-        dup_pct    = round(dup_count / total_rows * 100, 2) if total_rows > 0 else 0.0
+    # 2. Extract stats and determine bounds for outlier pass
+    bounds = {}
+    outlier_exprs = []
+    for c in columns_to_profile:
+        mean_val = stats_row[f"avg_{c}"]
+        stddev_val = stats_row[f"stddev_{c}"]
+        if mean_val is not None and stddev_val is not None and stddev_val > 0:
+            lower = mean_val - 3 * stddev_val
+            upper = mean_val + 3 * stddev_val
+            bounds[c] = (lower, upper, mean_val, stddev_val)
+            num_col = col(c).cast("double")
+            outlier_exprs.append(
+                F.sum(F.when((num_col < lower) | (num_col > upper), 1).otherwise(0)).alias(f"outliers_{c}")
+            )
+        else:
+            bounds[c] = None
+
+    # 3. Single aggregation pass for all outliers
+    outliers_row = None
+    if outlier_exprs:
+        outliers_row = df.agg(*outlier_exprs).collect()[0]
+
+    # 4. Generate profile records
+    for c in columns_to_profile:
+        null_count = stats_row[f"null_cnt_{c}"] or 0
+        null_pct = round(null_count / total_rows * 100, 2) if total_rows > 0 else 0.0
+
+        distinct_count = stats_row[f"distinct_cnt_{c}"] or 0
+        dup_count = total_rows - distinct_count
+        dup_pct = round(dup_count / total_rows * 100, 2) if total_rows > 0 else 0.0
 
         # Top 5 values
         top_values = []
         try:
-            top_df = df.groupBy(col_name).count().orderBy(F.desc("count")).limit(5)
-            top_values = [str(r[col_name]) for r in top_df.collect()]
+            top_df = df.groupBy(col(c)).count().orderBy(F.desc("count")).limit(5)
+            top_values = [str(r[c]) for r in top_df.collect()]
         except Exception:
             pass
 
-        # Min/Max/Mean/Stddev for numeric-like columns
-        min_val = max_val = mean_val = stddev_val = None
+        min_val = stats_row[f"min_{c}"]
+        max_val = stats_row[f"max_{c}"]
+        mean_val = round(stats_row[f"avg_{c}"], 2) if stats_row[f"avg_{c}"] is not None else None
+        stddev_val = round(stats_row[f"stddev_{c}"], 2) if stats_row[f"stddev_{c}"] is not None else None
+
         outlier_count = 0
-
-        try:
-            # Try casting to double for numeric stats
-            num_df = df.withColumn("__num", col(col_name).cast("double")).filter(col("__num").isNotNull())
-            stats = num_df.agg(
-                F.min("__num").alias("min_val"),
-                F.max("__num").alias("max_val"),
-                F.avg("__num").alias("mean_val"),
-                F.stddev("__num").alias("stddev_val")
-            ).collect()[0]
-            min_val    = stats["min_val"]
-            max_val    = stats["max_val"]
-            mean_val   = round(stats["mean_val"], 2) if stats["mean_val"] else None
-            stddev_val = round(stats["stddev_val"], 2) if stats["stddev_val"] else None
-
-            # Outlier detection: values outside mean ± 3×stddev
-            if mean_val is not None and stddev_val is not None and stddev_val > 0:
-                lower = mean_val - 3 * stddev_val
-                upper = mean_val + 3 * stddev_val
-                outlier_count = num_df.filter(
-                    (col("__num") < lower) | (col("__num") > upper)
-                ).count()
-                if outlier_count > 0:
-                    anomalies.append(
-                        f"Column '{col_name}': {outlier_count} outlier(s) detected "
-                        f"(outside [{lower:.1f}, {upper:.1f}])"
-                    )
-        except Exception:
-            pass
+        if bounds[c] and outliers_row:
+            outlier_count = outliers_row[f"outliers_{c}"] or 0
+            if outlier_count > 0:
+                lower, upper, _, _ = bounds[c]
+                anomalies.append(
+                    f"Column '{c}': {outlier_count} outlier(s) detected (outside [{lower:.1f}, {upper:.1f}])"
+                )
 
         profile_records.append({
             "run_id":          run_id,
             "source_file":     source_file,
-            "column_name":     col_name,
+            "column_name":     c,
             "total_rows":      float(total_rows),
             "null_count":      float(null_count),
             "null_pct":        float(null_pct),
@@ -97,6 +116,8 @@ def profile_dataframe(df: DataFrame, run_id: str, source_file: str, spark: Spark
 
     # Volume anomaly detection vs previous run
     anomalies += _detect_volume_anomalies(spark, total_rows, run_id)
+    
+    # Clean cache done by caller
 
     return profile_records, anomalies, total_rows
 

@@ -26,7 +26,7 @@ def _load_config():
     return {}
 
 
-def validate_data(spark=None, run_id="unknown", source_file="unknown"):
+def validate_data(spark=None, run_id="unknown", source_file="unknown", bronze_df=None):
     """
     Runs enterprise row-level DQ on Bronze data.
     Returns: (valid_df, invalid_df, scorecard, should_fail)
@@ -39,15 +39,13 @@ def validate_data(spark=None, run_id="unknown", source_file="unknown"):
     spark.sparkContext.setLogLevel(SPARK_LOG_LEVEL)
 
     try:
-        if not os.path.exists(BRONZE_PATH):
-            print("[Validate] Bronze path does not exist. Nothing to validate.")
-            return None, None, {}, False
-
-        df = read_delta(spark, BRONZE_PATH)
-        total_rows = df.count()
-        if total_rows == 0:
-            print("[Validate] Bronze table is empty. Nothing to validate.")
-            return None, None, {}, False
+        if bronze_df is not None:
+            df = bronze_df
+        else:
+            if not os.path.exists(BRONZE_PATH):
+                print("[Validate] Bronze path does not exist. Nothing to validate.")
+                return None, None, {}, False
+            df = read_delta(spark, BRONZE_PATH)
 
         # Run enterprise DQ engine
         valid_df, invalid_df, scorecard = run_dq_engine(df, run_id=run_id, source_file=source_file)

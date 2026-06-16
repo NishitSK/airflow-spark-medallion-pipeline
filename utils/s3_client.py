@@ -290,3 +290,28 @@ def export_text_to_s3(text: str, s3_key: str, run_id: str = "") -> bool:
         content_type="text/plain",
         metadata={"run_id": run_id, "exported_at": str(int(time.time()))},
     )
+
+
+def download_object_bytes(s3_key: str) -> Optional[bytes]:
+    """
+    Download an object from S3 and return its body as bytes.
+    """
+    bucket = _get_bucket()
+    if not bucket:
+        logger.warning("[S3] S3_BUCKET not configured — cannot download object.")
+        return None
+
+    try:
+        client = get_s3_client()
+        if client is None:
+            return None
+
+        response = client.get_object(Bucket=bucket, Key=s3_key)
+        data = response["Body"].read()
+        logger.info(f"[S3] ✅ download_object_bytes: s3://{bucket}/{s3_key} ({len(data):,} bytes downloaded)")
+        return data
+
+    except Exception as e:
+        logger.error(f"[S3] ❌ download_object_bytes failed: s3://{bucket}/{s3_key} — {type(e).__name__}: {e}")
+        return None
+

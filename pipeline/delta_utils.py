@@ -2,49 +2,31 @@ import os
 from pyspark.sql import SparkSession
 from pipeline.config import DELTA_PACKAGE, JAVA_OPTS
 
-def get_spark_session(app_name="MedallionPipeline"):
+def get_spark_session(app_name="MedallionPipeline", shuffle_partitions=1):
     """
     Standardized SparkSession builder with Delta support and Java 17+ fixes.
     """
-    os.environ["PYSPARK_SUBMIT_ARGS"] = f"--packages {DELTA_PACKAGE} pyspark-shell"
+    os.environ["PYSPARK_SUBMIT_ARGS"] = "pyspark-shell"
     
     return SparkSession.builder \
         .appName(app_name) \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-        .config("spark.sql.shuffle.partitions", "1") \
+        .config("spark.sql.shuffle.partitions", str(shuffle_partitions)) \
+        .config("spark.default.parallelism", str(shuffle_partitions)) \
         .config("spark.databricks.delta.schema.autoMerge.enabled", "true") \
         .config("spark.sql.ansi.enabled", "false") \
         .config("spark.driver.extraJavaOptions", JAVA_OPTS) \
         .config("spark.executor.memory", "512m") \
         .config("spark.driver.memory", "512m") \
+        .config("spark.ui.enabled", "false") \
+        .config("spark.sql.adaptive.enabled", "false") \
         .getOrCreate()
 
 def read_delta(spark, path):
     return spark.read.format("delta").load(path)
 
 def write_delta(df, path, mode="append", partition_by=None):
-    from pyspark.sql import SparkSession
-    import os
-    
-    print("\nIncoming Schema:")
-    df.printSchema()
-    
-    print("Existing Delta Schema:")
-    try:
-        active_spark = SparkSession.getActiveSession()
-        if active_spark is not None:
-            if os.path.exists(path) and os.listdir(path):
-                existing_df = active_spark.read.format("delta").load(path)
-                existing_df.printSchema()
-            else:
-                print("No existing Delta table files found (new table will be created)")
-        else:
-            print("Unknown (Active SparkSession not found)")
-    except Exception as e:
-        print(f"No existing Delta table found or failed to read schema: {str(e)}")
-    print()
-    
     writer = df.write.format("delta").mode(mode)
     if mode == "overwrite":
         writer = writer.option("overwriteSchema", "true")

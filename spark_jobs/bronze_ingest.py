@@ -82,6 +82,7 @@ def ingest_bronze(spark=None, run_id="unknown"):
         except Exception as schema_err:
             print(f"[Bronze] Warning: Schema mapping failed: {schema_err}")
 
+        df = df.cache()
         row_count = df.count()
         if row_count > 0:
             write_delta(df, BRONZE_PATH, mode="overwrite")
@@ -90,6 +91,7 @@ def ingest_bronze(spark=None, run_id="unknown"):
             return df, source_file
         else:
             print("[Bronze] Input files were empty.")
+            df.unpersist()
             return None, "unknown"
 
     except Exception as e:

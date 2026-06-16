@@ -6,13 +6,14 @@ os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
 # Base paths
-# Detect if we are in the container (/data exists) or local (use relative path)
-if os.path.exists("/data") and os.name != "nt":
-    BASE_DATA_PATH = "/data"
-else:
-
-    # Fallback for local development outside Docker
-    BASE_DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+# Support environment variable override for fast I/O paths
+BASE_DATA_PATH = os.environ.get("BASE_DATA_PATH_OVERRIDE")
+if not BASE_DATA_PATH:
+    if os.path.exists("/data") and os.name != "nt":
+        BASE_DATA_PATH = "/data"
+    else:
+        # Fallback for local development outside Docker
+        BASE_DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 INPUT_PATH = f"{BASE_DATA_PATH}/input"
 ARCHIVE_PATH = f"{BASE_DATA_PATH}/archive"
@@ -94,50 +95,59 @@ try:
 except AttributeError:
     pass
 
-print("=== SYSTEM ENVIRONMENT DIAGNOSTICS ===")
-print(f"Current Execution UID: {uid} | GID: {gid}")
-print("======================================")
+if os.environ.get("SKIP_DIAGNOSTICS") != "1":
+    print("=== SYSTEM ENVIRONMENT DIAGNOSTICS ===")
+    print(f"Current Execution UID: {uid} | GID: {gid}")
+    print("======================================")
 
-validation_failed = False
+    validation_failed = False
 
-for path_str in REQUIRED_PATHS:
-    try:
-        path = Path(path_str)
-        # Ensure directory exists
-        path.mkdir(parents=True, exist_ok=True)
-        
-        # Log ownership and permissions
-        stat_info = path.stat()
-        mode = stat_info.st_mode
-        perms = stat.filemode(mode)
-        path_uid = stat_info.st_uid
-        path_gid = stat_info.st_gid
-        
-        # Test writability by touching a temp file
-        test_file = path / f".write_test_{os.getpid()}"
+    for path_str in REQUIRED_PATHS:
         try:
-            test_file.touch(exist_ok=True)
-            test_file.unlink()
-            writable = True
-        except Exception:
-            writable = False
+            path = Path(path_str)
+            # Ensure directory exists
+            path.mkdir(parents=True, exist_ok=True)
             
-        print(f"Directory: {path_str} | Owner UID: {path_uid} | Owner GID: {path_gid} | Perms: {perms} | Writable: {writable}")
-        
-        if not writable:
-            # We fail fast for crucial medallion data directories
+            # Log ownership and permissions
+            stat_info = path.stat()
+            mode = stat_info.st_mode
+            perms = stat.filemode(mode)
+            path_uid = stat_info.st_uid
+            path_gid = stat_info.st_gid
+            
+            # Test writability by touching a temp file
+            test_file = path / f".write_test_{os.getpid()}"
+            try:
+                test_file.touch(exist_ok=True)
+                test_file.unlink()
+                writable = True
+            except Exception:
+                writable = False
+                
+            print(f"Directory: {path_str} | Owner UID: {path_uid} | Owner GID: {path_gid} | Perms: {perms} | Writable: {writable}")
+            
+            if not writable:
+                # We fail fast for crucial medallion data directories
+                validation_failed = True
+                
+        except Exception as e:
+            print(f"Directory: {path_str} | Error accessing/creating: {str(e)}")
             validation_failed = True
-            
-    except Exception as e:
-        print(f"Directory: {path_str} | Error accessing/creating: {str(e)}")
-        validation_failed = True
 
-print("======================================")
+    print("======================================")
 
-if validation_failed:
-    print("FATAL: One or more required data engineering directories are not writable by the current container user.", file=sys.stderr)
-    print("Please check docker volume permissions or ensure UID 50000 has write access.", file=sys.stderr)
-    # Fail fast if we are running inside a container
-    if os.path.exists("/data"):
-        sys.exit(1)
+    if validation_failed:
+        print("FATAL: One or more required data engineering directories are not writable by the current container user.", file=sys.stderr)
+        print("Please check docker volume permissions or ensure UID 50000 has write access.", file=sys.stderr)
+        # Fail fast if we are running inside a container
+        if os.path.exists("/data"):
+            sys.exit(1)
+else:
+    # Silently ensure directories exist without expensive I/O validation or prints
+    for path_str in REQUIRED_PATHS:
+        try:
+            Path(path_str).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
 

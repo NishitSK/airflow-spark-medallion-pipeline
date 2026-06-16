@@ -51,7 +51,7 @@ with DAG(
     # Run Spark unified medallion pipeline
     unified_pipeline = BashOperator(
         task_id="unified_medallion_pipeline",
-        bash_command="python /opt/airflow/spark_jobs/unified_pipeline.py",
+        bash_command="python /opt/airflow/spark_jobs/unified_pipeline.py --airflow-start-time '{{ dag_run.start_date.timestamp() if dag_run else 0 }}'",
     )
 
     # Archive processed files on success
