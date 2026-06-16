@@ -57,24 +57,76 @@ JAVA_OPTS = (
 )
 
 # Startup Directory Creation and Writability Validation
-from pathlib import Path
 import os
+import sys
+import stat
+from pathlib import Path
 
-for path in [
-    "/data/input",
-    "/data/output",
-    "/data/archive",
-    "/data/bronze",
-    "/data/silver",
-    "/data/gold",
-]:
+# Required paths for the application
+REQUIRED_PATHS = [
+    INPUT_PATH,
+    f"{BASE_DATA_PATH}/output",
+    ARCHIVE_PATH,
+    BRONZE_PATH,
+    SILVER_PATH,
+    GOLD_PATH,
+    DQ_METRICS_PATH,
+    TRACE_PATH,
+]
+
+# Print current environment diagnostics
+uid = None
+gid = None
+try:
+    uid = os.getuid()
+    gid = os.getgid()
+except AttributeError:
+    pass
+
+print("=== SYSTEM ENVIRONMENT DIAGNOSTICS ===")
+print(f"Current Execution UID: {uid} | GID: {gid}")
+print("======================================")
+
+validation_failed = False
+
+for path_str in REQUIRED_PATHS:
     try:
-        Path(path).mkdir(parents=True, exist_ok=True)
-        # Test writability
-        test_file = Path(path) / f".write_test_{os.getpid()}"
-        test_file.touch(exist_ok=True)
-        test_file.unlink()
-        print(f"Directory {path}: writable")
-    except Exception:
-        print(f"Directory {path}: not writable")
+        path = Path(path_str)
+        # Ensure directory exists
+        path.mkdir(parents=True, exist_ok=True)
+        
+        # Log ownership and permissions
+        stat_info = path.stat()
+        mode = stat_info.st_mode
+        perms = stat.filemode(mode)
+        path_uid = stat_info.st_uid
+        path_gid = stat_info.st_gid
+        
+        # Test writability by touching a temp file
+        test_file = path / f".write_test_{os.getpid()}"
+        try:
+            test_file.touch(exist_ok=True)
+            test_file.unlink()
+            writable = True
+        except Exception:
+            writable = False
+            
+        print(f"Directory: {path_str} | Owner UID: {path_uid} | Owner GID: {path_gid} | Perms: {perms} | Writable: {writable}")
+        
+        if not writable:
+            # We fail fast for crucial medallion data directories
+            validation_failed = True
+            
+    except Exception as e:
+        print(f"Directory: {path_str} | Error accessing/creating: {str(e)}")
+        validation_failed = True
+
+print("======================================")
+
+if validation_failed:
+    print("FATAL: One or more required data engineering directories are not writable by the current container user.", file=sys.stderr)
+    print("Please check docker volume permissions or ensure UID 50000 has write access.", file=sys.stderr)
+    # Fail fast if we are running inside a container
+    if os.path.exists("/data"):
+        sys.exit(1)
 

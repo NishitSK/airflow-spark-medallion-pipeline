@@ -2,6 +2,7 @@ services:
   spark:
     image: apache/spark:4.0.0
     container_name: spark
+    user: "50000:0"
     ports:
       - "8080:8080"
     volumes:
