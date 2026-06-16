@@ -23,18 +23,18 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:admin"
-      PYTHONPATH: "/opt/airflow/plugins:/opt/airflow"
+      PYTHONPATH: "/opt/airflow"
       PYTHONUNBUFFERED: "1"
     volumes:
       - ../dags:/opt/airflow/dags
       - ../spark_jobs:/opt/airflow/spark_jobs
       - ../pipeline:/opt/airflow/pipeline
       - ../monitoring:/opt/airflow/monitoring
-      - ../plugins:/opt/airflow/plugins
       - ../data:/data
     ports:
       - "8081:8080"
-    command: airflow standalone
+    command: >
+      bash -c "echo '{\"${AIRFLOW_ADMIN_USER}\": \"${AIRFLOW_ADMIN_PASSWORD}\"}' > /opt/airflow/simple_auth_manager_passwords.json.generated && exec airflow standalone"
 
   streamlit:
     image: airflow-custom:latest
