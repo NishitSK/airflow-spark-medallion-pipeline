@@ -97,7 +97,7 @@ if "connection_error" not in st.session_state:
 if st.session_state.connection_verified is None:
     try:
         import airflow_client
-        health = airflow_client.get_orchestrator_health()
+        health = airflow_client.get_airflow_health()
         if health == "UNAVAILABLE":
             st.session_state.connection_verified = False
             st.session_state.connection_error = "Pipeline service unavailable."
@@ -111,7 +111,7 @@ if st.session_state.connection_verified is None:
 # Sidebar Design
 with st.sidebar:
     st.title("🛡️ Pipeline Control")
-    st.caption("Lakehouse Orchestrator")
+    st.caption("Lakehouse Scheduler")
     st.divider()
     
     page = st.radio(
@@ -570,9 +570,9 @@ if page == "Pipeline Dashboard":
             # Health check variables
             airflow_status = "🔴 Unavailable"
             import airflow_client
-            health = airflow_client.get_orchestrator_health()
-            if health != "UNAVAILABLE":
-                airflow_status = "🟢 Ready" if health == "READY" else "🟡 Active"
+            health = airflow_client.get_airflow_health()
+            if health == "AVAILABLE":
+                airflow_status = "🟢 Available"
             
             spark_status = "🟢 Available" if spark is not None else "🔴 Unavailable"
             input_writable = "🟢 Accessible" if os.access(INPUT_PATH, os.W_OK) else "🔴 Inaccessible"
@@ -821,9 +821,9 @@ elif page == "Data Quality & Observability":
             # Connection statuses
             airflow_status = "🔴 Unavailable"
             import airflow_client
-            health = airflow_client.get_orchestrator_health()
-            if health != "UNAVAILABLE":
-                airflow_status = "🟢 Ready" if health == "READY" else "🟡 Active"
+            health = airflow_client.get_airflow_health()
+            if health == "AVAILABLE":
+                airflow_status = "🟢 Available"
                     
             spark_status = "🟢 Available" if spark is not None else "🔴 Unavailable"
             
