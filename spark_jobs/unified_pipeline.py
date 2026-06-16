@@ -99,6 +99,7 @@ def run_unified_pipeline():
     start_time = time.time()
     spark = get_spark_session("UnifiedMedallionPipeline")
     run_id = f"run_{int(start_time)}"
+    current_stage = "Bronze"
     
     try:
         print("--- Starting Unified Medallion Pipeline ---")
@@ -110,23 +111,26 @@ def run_unified_pipeline():
         
         # 2. Data Quality Validation (Blocker)
         print("\n[Layer 1.5: Data Quality Validation]")
+        current_stage = "Validation"
         write_status("running", run_id, stage="Validation")
         dq_pass = validate_data(spark=spark)
         if not dq_pass:
             error_msg = "Pipeline halted due to critical Data Quality issues in Bronze."
             print(f"\nSTOP: {error_msg}")
             log_incident("unified_pipeline", run_id, "validation_step", error_msg, "CRITICAL")
-            write_status("failed", run_id, error=error_msg, stage="Failed")
+            write_status("failed", run_id, error=error_msg, stage="Validation")
             append_to_history("failed", run_id, file_name=None, error=error_msg, duration=time.time()-start_time, rows=0)
             return
         
         # 3. Silver Transformation
         print("\n[Layer 2: Silver]")
+        current_stage = "Silver"
         write_status("running", run_id, stage="Silver")
         transform_silver(spark=spark)
         
         # 4. Gold Metrics Generation
         print("\n[Layer 3: Gold]")
+        current_stage = "Gold"
         write_status("running", run_id, stage="Gold")
         generate_gold(spark=spark)
         
@@ -164,7 +168,7 @@ def run_unified_pipeline():
         duration = time.time() - start_time
         print(f"\n--- Unified Pipeline Failed: {error_msg} ---")
         log_incident("unified_pipeline", run_id, "main_process", error_msg, "ERROR")
-        write_status("failed", run_id, error=error_msg, stage="Failed")
+        write_status("failed", run_id, error=error_msg, stage=current_stage)
         append_to_history("failed", run_id, file_name=None, error=error_msg, duration=duration, rows=0)
         sys.exit(1)
 
