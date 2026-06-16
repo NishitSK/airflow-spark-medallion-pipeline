@@ -23,8 +23,8 @@ services:
       - ../.env
     environment:
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
-      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER}:admin"
+      AIRFLOW__CORE__FERNET_KEY: $${AIRFLOW_FERNET_KEY}
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "$${AIRFLOW_ADMIN_USER}:admin"
       PYTHONPATH: "/opt/airflow"
       PYTHONUNBUFFERED: "1"
     volumes:
@@ -32,11 +32,14 @@ services:
       - ../spark_jobs:/opt/airflow/spark_jobs
       - ../pipeline:/opt/airflow/pipeline
       - ../monitoring:/opt/airflow/monitoring
+      - ../utils:/opt/airflow/utils
+      - ../dashboard:/opt/airflow/dashboard
       - ../data:/data
     ports:
       - "8081:8080"
     command: >
-      bash -c "python3 -c \"import pipeline.config\" && echo '{\"${AIRFLOW_ADMIN_USER}\": \"${AIRFLOW_ADMIN_PASSWORD}\"}' > /opt/airflow/simple_auth_manager_passwords.json.generated && exec airflow standalone"
+      bash -c "python3 -c \"import pipeline.config\" && python3 -c \"import os, json; json.dump({os.environ.get('AIRFLOW_ADMIN_USER', 'admin'): os.environ.get('AIRFLOW_ADMIN_PASSWORD', 'admin123')}, open('/opt/airflow/simple_auth_manager_passwords.json.generated', 'w'))\" && exec airflow standalone"
+
 
   streamlit:
     image: airflow-custom:latest
@@ -54,6 +57,9 @@ services:
     volumes:
       - ../dashboard:/app
       - ../pipeline:/app/pipeline
+      - ../spark_jobs:/app/spark_jobs
+      - ../monitoring:/app/monitoring
+      - ../utils:/app/utils
       - ../data:/data
     ports:
       - "8501:8501"

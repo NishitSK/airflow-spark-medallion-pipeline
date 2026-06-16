@@ -18,7 +18,15 @@ from queries import (
     get_last_uploaded_file,
     get_dq_audit_details,
     get_dq_trends,
-    get_incidents
+    get_incidents,
+    get_gold_report_data,
+    generate_txt_report,
+    generate_pdf_report,
+    get_quarantine_data,
+    get_profile_data,
+    get_dq_run_report,
+    get_schema_mapping_log,
+    get_latest_successful_run_id,
 )
 from charts import (
     plot_age_distribution, 
@@ -331,6 +339,15 @@ if page == "Pipeline Dashboard":
                                 # Separate staging copy from temporary upload
                                 shutil.copyfile(temp_path, final_path)
                                 
+                                # S3 raw upload (non-blocking)
+                                try:
+                                    from utils.s3_client import upload_file
+                                    s3_key = f"raw/uploads/{uploaded_file.name}"
+                                    upload_file(final_path, s3_key)
+                                    st.caption(f"☁️ Archived to S3: `{s3_key}`")
+                                except Exception as s3_err:
+                                    print(f"[S3] Warning: raw upload failed (non-fatal): {s3_err}")
+
                                 # Cleanup the temp file
                                 try:
                                     os.remove(temp_path)
@@ -374,6 +391,15 @@ if page == "Pipeline Dashboard":
                         content = f_in.read()
                     with open(dest, "wb") as f_out:
                         f_out.write(content)
+
+                # S3 raw upload (non-blocking)
+                try:
+                    from utils.s3_client import upload_file
+                    s3_key = f"raw/uploads/{file}"
+                    upload_file(dest, s3_key)
+                    st.caption(f"☁️ Archived to S3: `{s3_key}`")
+                except Exception as s3_err:
+                    print(f"[S3] Warning: raw upload failed (non-fatal): {s3_err}")
                         
                 st.session_state.last_uploaded_file = file
                 
@@ -702,6 +728,150 @@ if page == "Pipeline Dashboard":
             st.markdown(f"**Estimated Processing Cost:** `{cost_val}`")
             st.markdown(f"**Estimated Processing Time:** `{time_val}`")
 
+    # ----------------- PIPELINE OUTPUTS SECTION -----------------
+    st.divider()
+    st.subheader("Pipeline Outputs")
+    
+    # Check if latest run was successful and if report data is available
+    latest_run_is_success = False
+    latest_run_id = None
+    if os.path.exists(HISTORY_FILE):
+        try:
+            import json
+            with open(HISTORY_FILE, "r") as f:
+                lines = [json.loads(line.strip()) for line in f if line.strip()]
+                if lines:
+                    latest_run = lines[-1]
+                    latest_run_id = latest_run.get("run_id")
+                    if latest_run.get("status") == "completed":
+                        latest_run_is_success = True
+        except Exception as e:
+            print(f"Error checking history for output status: {e}")
+
+    # If the current status is running or failed, do not expose the outputs
+    if status in ["Pipeline running", "Pipeline failed"]:
+        latest_run_is_success = False
+
+    report_data = None
+    if latest_run_is_success:
+        try:
+            report_data = get_gold_report_data(spark)
+        except Exception as e:
+            print(f"Error getting report data: {e}")
+
+    if report_data is None:
+        st.warning("⚠️ No successful pipeline execution outputs are currently available. Stage a dataset and run the pipeline to generate outputs.")
+    else:
+        run_id = report_data.get("run_id", "Unknown")
+        
+        # Load Silver Delta table for this run
+        silver_df = load_layer_data(spark, SILVER_PATH)
+        csv_bytes = b""
+        if silver_df is not None:
+            try:
+                silver_pdf = silver_df.toPandas()
+                csv_bytes = convert_df_to_csv(silver_pdf)
+            except Exception as e:
+                print(f"Error converting Silver dataset to CSV: {str(e)}")
+                
+        # Generate TXT and PDF reports
+        txt_report = generate_txt_report(report_data)
+        pdf_bytes = generate_pdf_report(report_data)
+        
+        # Get S3 Metadata and presigned URLs
+        from queries import get_s3_export_metadata, get_s3_download_url
+        s3_meta = get_s3_export_metadata(run_id)
+        
+        url_cleaned = get_s3_download_url(f"exports/{run_id}/cleaned_dataset.csv")
+        url_rejected = get_s3_download_url(f"quarantine/{run_id}/rejected_records.csv")
+        url_report = get_s3_download_url(f"reports/{run_id}/gold_report.txt")
+        
+        col_actions, col_report = st.columns([1, 2])
+        
+        with col_actions:
+            st.markdown("##### ☁️ S3 Storage")
+            if url_cleaned or url_rejected or url_report:
+                st.success("S3 Integration Active")
+                
+                # 📥 Download Cleaned Dataset
+                if url_cleaned:
+                    st.markdown(f'<a href="{url_cleaned}" target="_blank"><button style="width:100%; border-radius:5px; padding:10px; background-color:#1E1E1E; color:white; border:1px solid #333; margin-bottom:10px;">📥 S3 Download: Cleaned Dataset</button></a>', unsafe_allow_html=True)
+                elif csv_bytes:
+                    st.download_button(
+                        label="📥 Local Download: Cleaned Dataset",
+                        data=csv_bytes,
+                        file_name=f"cleaned_dataset_{run_id}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                else:
+                    st.button("📥 Download Cleaned Dataset", disabled=True, use_container_width=True)
+                
+                # 📄 Download Report (TXT)
+                if url_report:
+                     st.markdown(f'<a href="{url_report}" target="_blank"><button style="width:100%; border-radius:5px; padding:10px; background-color:#1E1E1E; color:white; border:1px solid #333; margin-bottom:10px;">📄 S3 Download: Report (TXT)</button></a>', unsafe_allow_html=True)
+                else:
+                    st.download_button(
+                        label="📄 Local Download: Report (TXT)",
+                        data=txt_report,
+                        file_name=f"gold_analytics_report_{run_id}.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                    )
+                
+                # ⬇️ Download Rejected Records
+                try:
+                    q_df_output = get_quarantine_data(spark, run_id=run_id)
+                    has_rejects = not q_df_output.empty
+                except:
+                    has_rejects = False
+                    
+                if url_rejected:
+                     st.markdown(f'<a href="{url_rejected}" target="_blank"><button style="width:100%; border-radius:5px; padding:10px; background-color:#1E1E1E; color:white; border:1px solid #333; margin-bottom:10px;">⬇️ S3 Download: Rejected Records</button></a>', unsafe_allow_html=True)
+                elif has_rejects:
+                     rejected_bytes = q_df_output.to_csv(index=False).encode("utf-8")
+                     st.download_button(
+                        label=f"⬇️ Local Download: Rejected Records ({len(q_df_output)})",
+                        data=rejected_bytes,
+                        file_name=f"rejected_records_{run_id}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                     )
+                else:
+                     st.success("✅ No rejected records")
+
+                st.markdown("---")
+                
+                # Metadata panel
+                if s3_meta.get("cleaned_dataset"):
+                    st.caption(f"`exports/{run_id}/cleaned_dataset.csv` ({s3_meta['cleaned_dataset'].get('size_mb', 0):.2f} MB)")
+                if s3_meta.get("rejected_records"):
+                    st.caption(f"`quarantine/{run_id}/rejected_records.csv` ({s3_meta['rejected_records'].get('size_mb', 0):.2f} MB)")
+                if s3_meta.get("gold_report"):
+                    st.caption(f"`reports/{run_id}/gold_report.txt` ({s3_meta['gold_report'].get('size_mb', 0):.2f} MB)")
+            else:
+                st.warning("S3 Integration Offline")
+                # Fallback to local
+                if csv_bytes:
+                    st.download_button(label="📥 Download Cleaned Dataset", data=csv_bytes, file_name=f"cleaned_dataset_{run_id}.csv", mime="text/csv", use_container_width=True)
+                st.download_button(label="📄 Download Report (TXT)", data=txt_report, file_name=f"gold_analytics_report_{run_id}.txt", mime="text/plain", use_container_width=True)
+                if pdf_bytes:
+                    st.download_button(label="📄 Download Report (PDF)", data=pdf_bytes, file_name=f"gold_analytics_report_{run_id}.pdf", mime="application/pdf", use_container_width=True)
+                try:
+                    q_df_output = get_quarantine_data(spark, run_id=run_id)
+                    if not q_df_output.empty:
+                        rejected_bytes = q_df_output.to_csv(index=False).encode("utf-8")
+                        st.download_button(label=f"⬇️ Download Rejected Records ({len(q_df_output)})", data=rejected_bytes, file_name=f"rejected_records_{run_id}.csv", mime="text/csv", use_container_width=True)
+                    else:
+                        st.success("✅ No rejected records")
+                except:
+                    pass
+
+        with col_report:
+            # 📊 View Gold Analytics Report
+            with st.expander("📊 View Gold Analytics Report", expanded=True):
+                st.text(txt_report)
+
     st.divider()
     
     # Medallion Tabs
@@ -809,6 +979,101 @@ if page == "Pipeline Dashboard":
         st.dataframe(pd.DataFrame(history_table_data), use_container_width=True)
     else:
         st.info("No runs logged yet.")
+
+    # ========== ENTERPRISE DATA QUALITY SUMMARY ==========
+    st.divider()
+    st.subheader("🎯 Enterprise Data Quality Summary")
+
+    latest_run_id = get_latest_successful_run_id()
+    dq_report = get_dq_run_report(spark, run_id=latest_run_id) if latest_run_id else None
+
+    if dq_report:
+        total_r  = int(float(dq_report.get("total_rows", 0) or 0))
+        valid_r  = int(float(dq_report.get("valid_rows", 0) or 0))
+        invalid_r = int(float(dq_report.get("invalid_rows", 0) or 0))
+        dq_sc   = float(dq_report.get("dq_score", 100.0) or 100.0)
+        anomaly_str = str(dq_report.get("anomaly_flags", "None") or "None")
+        mapping_str = str(dq_report.get("schema_mappings", "[]") or "[]")
+
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("🏆 DQ Score", f"{dq_sc:.1f}%")
+            c2.metric("✅ Records Accepted", f"{valid_r:,}")
+            c3.metric("🚫 Records Quarantined", f"{invalid_r:,}")
+            c4.metric("📊 Total Received", f"{total_r:,}")
+
+            col_anomaly, col_mapping = st.columns(2)
+            with col_anomaly:
+                with st.container(border=True):
+                    st.markdown("**🔍 Anomalies Detected**")
+                    if anomaly_str and anomaly_str != "None":
+                        for line in anomaly_str.split(";"):
+                            if line.strip():
+                                st.warning(f"⚠️ {line.strip()}")
+                    else:
+                        st.success("✅ No anomalies detected in this run.")
+            with col_mapping:
+                with st.container(border=True):
+                    st.markdown("**🔄 Schema Mappings Applied**")
+                    try:
+                        import json as _json
+                        mappings = _json.loads(mapping_str) if mapping_str != "[]" else []
+                        if mappings:
+                            for m in mappings:
+                                st.info(f"↪️ `{m.get('from_col', '?')}` → `{m.get('to_col', '?')}`")
+                        else:
+                            st.success("✅ Schema matched canonical format — no mapping required.")
+                    except Exception:
+                        st.caption(mapping_str)
+    else:
+        st.info("⚠️ No DQ report available yet. Run the pipeline to generate a quality report.")
+
+    # ========== DATA PROFILE SECTION ==========
+    st.divider()
+    st.subheader("📐 Data Profile")
+    profile_df = get_profile_data(spark, run_id=latest_run_id)
+    if not profile_df.empty:
+        display_cols = [c for c in ["column_name", "total_rows", "null_count", "null_pct",
+                                      "distinct_count", "duplicate_pct", "min_value",
+                                      "max_value", "mean_value", "stddev_value",
+                                      "outlier_count", "top_values"] if c in profile_df.columns]
+        with st.container(border=True):
+            st.dataframe(profile_df[display_cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("No data profile available yet. Run the pipeline to generate a column profile.")
+
+    # ========== QUARANTINE VIEWER ==========
+    st.divider()
+    st.subheader("🚫 Quarantine Viewer — Rejected Records")
+    quarantine_df = get_quarantine_data(spark, run_id=latest_run_id)
+    if not quarantine_df.empty:
+        q_count = len(quarantine_df)
+        st.warning(f"**{q_count}** record(s) quarantined in the latest run. These records were rejected due to data quality violations and were NOT written to Silver.")
+
+        # Download rejected records
+        try:
+            rejected_csv = quarantine_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="⬇️ Download Rejected Records CSV",
+                data=rejected_csv,
+                file_name=f"rejected_records_{latest_run_id}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="dl_quarantine_btn"
+            )
+        except Exception:
+            pass
+
+        # Show quarantine table with key columns first
+        priority_cols = [c for c in ["id", "name", "age", "quarantine_reason", "rule_violated",
+                                       "run_id", "dq_source_file", "quarantine_time"]
+                         if c in quarantine_df.columns]
+        other_cols = [c for c in quarantine_df.columns if c not in priority_cols]
+        with st.container(border=True):
+            st.dataframe(quarantine_df[priority_cols + other_cols].head(200),
+                         use_container_width=True, hide_index=True)
+    else:
+        st.success("✅ No records were quarantined in the latest successful run.")
 
 elif page == "Delta Lake Transaction Log":
     from delta.tables import DeltaTable

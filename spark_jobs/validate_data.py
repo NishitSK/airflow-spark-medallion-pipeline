@@ -1,105 +1,101 @@
-from pyspark.sql.functions import col, count, when, sum as _sum, trim, regexp_replace
+"""
+Validate Data
+=============
+Delegates to the enterprise DQ Engine for row-level validation.
+Writes scorecard metrics. Returns (valid_df, invalid_df, scorecard, should_fail).
+"""
+import sys
+import os
+import yaml
+from pyspark.sql import SparkSession
 from pipeline.config import BRONZE_PATH, DQ_METRICS_PATH, SPARK_LOG_LEVEL
 from pipeline.delta_utils import get_spark_session, read_delta, write_delta
+from spark_jobs.dq_engine import run_dq_engine, write_dq_scorecard, exceeds_threshold
+from pyspark.sql.functions import current_timestamp
 
-def validate_data(spark=None):
+
+def _load_config():
+    paths = [
+        "/opt/airflow/pipeline/dq_config.yaml",
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "pipeline", "dq_config.yaml"),
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            with open(p) as f:
+                return yaml.safe_load(f)
+    return {}
+
+
+def validate_data(spark=None, run_id="unknown", source_file="unknown"):
     """
-    Performs DQ checks on Bronze data before Silver transformation.
-    Returns True if data quality is acceptable, False otherwise.
+    Runs enterprise row-level DQ on Bronze data.
+    Returns: (valid_df, invalid_df, scorecard, should_fail)
     """
     own_spark = False
     if spark is None:
         spark = get_spark_session("DataValidation")
         own_spark = True
-        
+
     spark.sparkContext.setLogLevel(SPARK_LOG_LEVEL)
 
     try:
-        import os
         if not os.path.exists(BRONZE_PATH):
-            print("Validation: Bronze layer directory does not exist yet. No data to validate.")
-            return True
-            
+            print("[Validate] Bronze path does not exist. Nothing to validate.")
+            return None, None, {}, False
+
         df = read_delta(spark, BRONZE_PATH)
         total_rows = df.count()
-        
         if total_rows == 0:
-            print("Validation: No data found in Bronze.")
-            return True
+            print("[Validate] Bronze table is empty. Nothing to validate.")
+            return None, None, {}, False
 
-        # DQ Checks on raw String fields
-        # Clean float formats (e.g. 1001.0 -> 1001) for numeric checks
-        cleaned_id = regexp_replace(trim(col("id")), r"\.0+$", "")
-        parsed_id = cleaned_id.cast("int")
-        
-        cleaned_age = regexp_replace(trim(col("age")), r"\.0+$", "")
-        parsed_age = cleaned_age.cast("int")
+        # Run enterprise DQ engine
+        valid_df, invalid_df, scorecard = run_dq_engine(df, run_id=run_id, source_file=source_file)
 
-        # Determine malformed ID (not empty, but fails to parse to int)
-        is_malformed_id = parsed_id.isNull() & col("id").isNotNull() & (trim(col("id")) != "")
-        
-        # Determine malformed age (not empty, but fails to parse to int)
-        is_malformed_age = parsed_age.isNull() & col("age").isNotNull() & (trim(col("age")) != "")
+        # Persist DQ scorecard
+        write_dq_scorecard(scorecard, spark)
 
-        # Determine invalid age: out of bounds, or malformed/non-numeric
-        is_invalid_age = (parsed_age > 120) | is_malformed_age
+        # Write legacy DQ metrics for backward-compatible dashboard queries
+        _write_legacy_dq_metrics(scorecard, spark)
 
-        dq_results = df.select(
-            _sum(when(parsed_id.isNull(), 1).otherwise(0)).alias("null_ids"),
-            _sum(when(parsed_age < 0, 1).otherwise(0)).alias("negative_ages"),
-            _sum(when(is_invalid_age, 1).otherwise(0)).alias("invalid_ages")
-        ).collect()[0]
+        # Check thresholds
+        config = _load_config()
+        should_fail, reason = exceeds_threshold(scorecard, config)
+        if should_fail:
+            print(f"[Validate] CRITICAL DQ FAILURE: {reason}")
 
-        # Logging malformed IDs defensively
-        malformed_id_count = df.filter(is_malformed_id).count()
-        if malformed_id_count > 0:
-            print(f"WARNING: {malformed_id_count} records had malformed IDs that fail conversion to integers.")
-            sample_malformed = df.filter(is_malformed_id).select("id", "name").limit(5).collect()
-            print("Sample malformed IDs in Bronze: " + ", ".join([f"'{r['id']}' ({r['name']})" for r in sample_malformed]))
+        print(f"[Validate] DQ Score: {scorecard['dq_score']}% | "
+              f"Valid: {scorecard['valid_rows']} | Invalid: {scorecard['invalid_rows']}")
 
-        # Logging malformed ages defensively
-        malformed_age_count = df.filter(is_malformed_age).count()
-        if malformed_age_count > 0:
-            print(f"WARNING: {malformed_age_count} records had malformed ages that fail conversion to integers.")
-            sample_malformed_age = df.filter(is_malformed_age).select("age", "name").limit(5).collect()
-            print("Sample malformed ages in Bronze: " + ", ".join([f"'{r['age']}' ({r['name']})" for r in sample_malformed_age]))
-
-        # Duplicate check on normalized ID
-        normalized_df = df.withColumn("normalized_id", regexp_replace(trim(col("id")), r"\.0+$", ""))
-        dupe_count = total_rows - normalized_df.dropDuplicates(["normalized_id"]).count()
-
-        # Prepare metrics dataframe
-        from pyspark.sql.functions import current_timestamp
-        metrics_data = [(
-            total_rows,
-            int(dq_results["null_ids"] or 0),
-            int(dq_results["negative_ages"] or 0),
-            int(dq_results["invalid_ages"] or 0),
-            int(dupe_count)
-        )]
-        
-        cols = ["total_rows", "null_ids", "negative_ages", "invalid_ages", "duplicate_ids"]
-        metrics_df = spark.createDataFrame(metrics_data, cols) \
-                          .withColumn("validation_time", current_timestamp())
-        
-        # Write DQ metrics (append for history)
-        write_delta(metrics_df, DQ_METRICS_PATH, mode="append")
-        
-        # Validation Logic: Fail if 50% or more rows have Null IDs (Arbitrary threshold)
-        null_id_pct = (dq_results["null_ids"] or 0) / total_rows
-        if null_id_pct > 0.5:
-            print(f"CRITICAL DQ FAILURE: {null_id_pct:.2%} of rows have Null IDs.")
-            return False
-
-        print(f"Validation Success: {total_rows} rows checked. [{dupe_count} duplicates, {dq_results['null_ids']} null IDs]")
-        return True
+        return valid_df, invalid_df, scorecard, should_fail
 
     except Exception as e:
-        print(f"Validation Error: {str(e)}")
-        return False
+        print(f"[Validate] Error: {str(e)}")
+        return None, None, {}, False
     finally:
-        if own_spark: spark.stop()
+        if own_spark:
+            spark.stop()
+
+
+def _write_legacy_dq_metrics(scorecard: dict, spark: SparkSession):
+    """Write to legacy dq_metrics Delta table for backward-compatible dashboard charts."""
+    try:
+        metrics_data = [(
+            int(scorecard.get("total_rows", 0)),
+            int(scorecard.get("null_ids", 0)),
+            int(scorecard.get("invalid_ages", 0) + scorecard.get("null_ages", 0)),
+            int(scorecard.get("duplicate_ids", 0)),
+            int(scorecard.get("null_ages", 0)),
+        )]
+        cols = ["total_rows", "null_ids", "invalid_ages", "duplicate_ids", "negative_ages"]
+        metrics_df = spark.createDataFrame(metrics_data, cols) \
+            .withColumn("validation_time", current_timestamp())
+        write_delta(metrics_df, DQ_METRICS_PATH, mode="append")
+    except Exception as e:
+        print(f"[Validate] Warning: Could not write legacy DQ metrics: {e}")
+
 
 if __name__ == "__main__":
-    if not validate_data():
+    result = validate_data()
+    if result[3]:  # should_fail
         sys.exit(1)

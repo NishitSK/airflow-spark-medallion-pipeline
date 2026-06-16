@@ -32,6 +32,13 @@ STATUS_FILE = f"{BASE_DATA_PATH}/output/pipeline_status.json"
 SAMPLES_PATH = f"{BASE_DATA_PATH}/samples"
 HISTORY_FILE = f"{BASE_DATA_PATH}/output/pipeline_history.jsonl"
 
+# Enterprise DQ — New Layers
+QUARANTINE_PATH = f"{DELTA_PATH}/quarantine"
+PROFILE_PATH = f"{DELTA_PATH}/data_profile"
+DQ_REPORT_PATH = f"{DELTA_PATH}/dq_run_report"
+SCHEMA_MAP_LOG_PATH = f"{DELTA_PATH}/schema_mapping_log"
+DQ_CONFIG_FILE = f"{BASE_DATA_PATH}/../pipeline/dq_config.yaml"
+
 
 
 
@@ -72,6 +79,10 @@ REQUIRED_PATHS = [
     GOLD_PATH,
     DQ_METRICS_PATH,
     TRACE_PATH,
+    QUARANTINE_PATH,
+    PROFILE_PATH,
+    DQ_REPORT_PATH,
+    SCHEMA_MAP_LOG_PATH,
 ]
 
 # Print current environment diagnostics

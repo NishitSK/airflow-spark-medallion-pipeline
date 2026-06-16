@@ -1,0 +1,90 @@
+# ============================================================
+# Enterprise Data Quality Configuration
+# ============================================================
+# Modify thresholds and rules here without touching pipeline code.
+
+# -------------------------------------------------
+# Schema Column Aliases
+# Maps any incoming column name to the canonical name.
+# -------------------------------------------------
+schema_aliases:
+  id:
+    - id
+    - ID
+    - user_id
+    - customer_id
+    - record_id
+    - uid
+    - userId
+    - customerId
+  name:
+    - name
+    - full_name
+    - customer_name
+    - user_name
+    - fullname
+    - displayName
+    - display_name
+  age:
+    - age
+    - customer_age
+    - user_age
+    - years_old
+    - Age
+
+# -------------------------------------------------
+# Dataset-Level Thresholds
+# Pipeline fails only when these are exceeded.
+# -------------------------------------------------
+thresholds:
+  max_null_id_pct: 0.50       # Fail DAG if > 50% of IDs are null
+  max_invalid_pct: 0.80       # Warn if > 80% of any column has violations
+  min_row_count: 1            # Fail if dataset is empty
+
+# -------------------------------------------------
+# Column-Level Validation Rules
+# -------------------------------------------------
+columns:
+  id:
+    required: true
+    type: integer
+    allow_null: false
+    allow_duplicate: false
+
+  name:
+    required: true
+    type: string
+    allow_null: true           # Nulls allowed but flagged
+    min_length: 1
+    max_length: 200
+    regex: null                # Optional: "^[A-Za-z\\s\\-']+$"
+
+  age:
+    required: true
+    type: integer
+    allow_null: false
+    min_value: 0
+    max_value: 120
+    null_impute_value: 45      # Impute nulls with this value
+
+# -------------------------------------------------
+# Cleaning Rules
+# -------------------------------------------------
+cleaning:
+  name:
+    trim_whitespace: true
+    title_case: true           # "john doe" → "John Doe"
+  id:
+    strip_decimal_zeros: true  # "1001.0" → "1001"
+  age:
+    strip_decimal_zeros: true
+    impute_nulls: true         # Use null_impute_value from columns.age
+
+# -------------------------------------------------
+# Anomaly Detection Thresholds
+# -------------------------------------------------
+anomaly_detection:
+  null_spike_threshold: 0.20     # Alert if null % jumps > 20pp vs previous run
+  volume_drop_threshold: 0.30    # Alert if row count drops > 30% vs previous run
+  volume_spike_threshold: 2.00   # Alert if row count > 2× previous run
+  outlier_stddev: 3.0            # Flag values outside mean ± N×stddev

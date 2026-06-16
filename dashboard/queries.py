@@ -3,9 +3,40 @@ import json
 import time
 import streamlit as st
 import random
-from pipeline.config import BRONZE_PATH, SILVER_PATH, GOLD_PATH, TRACE_PATH, DQ_METRICS_PATH, METRICS_FILE, STATUS_FILE, INPUT_PATH, ARCHIVE_PATH, SAMPLES_PATH, HISTORY_FILE
+from pipeline.config import (
+    BRONZE_PATH, SILVER_PATH, GOLD_PATH, TRACE_PATH, DQ_METRICS_PATH,
+    METRICS_FILE, STATUS_FILE, INPUT_PATH, ARCHIVE_PATH, SAMPLES_PATH,
+    HISTORY_FILE, QUARANTINE_PATH, PROFILE_PATH, DQ_REPORT_PATH, SCHEMA_MAP_LOG_PATH
+)
 from pipeline.delta_utils import get_spark_session
 import airflow_client
+
+# --- S3 Helper Functions ---
+def get_s3_export_metadata(run_id):
+    """Fetch sizes and timestamps of S3 exports for a given run ID."""
+    metadata = {
+        "cleaned_dataset": None,
+        "rejected_records": None,
+        "gold_report": None
+    }
+    try:
+        from utils.s3_client import get_object_metadata
+        metadata["cleaned_dataset"] = get_object_metadata(f"exports/{run_id}/cleaned_dataset.csv")
+        metadata["rejected_records"] = get_object_metadata(f"quarantine/{run_id}/rejected_records.csv")
+        metadata["gold_report"] = get_object_metadata(f"reports/{run_id}/gold_report.txt")
+    except Exception as e:
+        print(f"Error fetching S3 export metadata: {e}")
+    return metadata
+
+def get_s3_download_url(s3_key, expiry=3600):
+    """Generate a presigned URL for an S3 object."""
+    try:
+        from utils.s3_client import generate_download_url
+        return generate_download_url(s3_key, expiry)
+    except Exception as e:
+        print(f"Error generating presigned URL for {s3_key}: {e}")
+        return None
+
 
 
 @st.cache_resource
@@ -548,4 +579,380 @@ def get_last_run_summary(_spark):
     return summary
 
 
+def get_gold_report_data(spark):
+    """
+    Retrieves consolidated metrics and summary datasets from all lakehouse layers
+    associated with the latest successful run.
+    """
+    import os
+    import json
+    import pandas as pd
+    from datetime import datetime
+    
+    report_data = {
+        "status": "N/A",
+        "run_id": "N/A",
+        "source_file": "N/A",
+        "timestamp": "N/A",
+        "rows_received": 0,
+        "rows_processed": 0,
+        "rows_rejected": 0,
+        "dq_score": "N/A",
+        "runtime": "N/A",
+        "null_ids": 0,
+        "invalid_ages": 0,
+        "duplicate_ids": 0,
+        "gold_summary": None
+    }
+    
+    # 1. Fetch latest record from history
+    last_record = None
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                lines = f.readlines()
+                for line in reversed(lines):
+                    rec = json.loads(line.strip())
+                    if rec.get("status") == "completed":
+                        last_record = rec
+                        break
+        except:
+            pass
+            
+    if not last_record:
+        return None
+        
+    report_data["run_id"] = last_record.get("run_id", "N/A")
+    report_data["source_file"] = last_record.get("file_name", "N/A")
+    duration_val = last_record.get("duration", "N/A")
+    if isinstance(duration_val, (int, float)):
+        report_data["runtime"] = f"{duration_val:.2f}s"
+    else:
+        try:
+            report_data["runtime"] = f"{float(duration_val):.2f}s"
+        except:
+            report_data["runtime"] = str(duration_val) + ("s" if duration_val != "N/A" else "")
+            
+    ts = last_record.get("timestamp")
+    if ts:
+        report_data["timestamp"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        
+    # 2. Get rows received (Bronze count)
+    try:
+        if os.path.exists(BRONZE_PATH) and spark is not None:
+            report_data["rows_received"] = spark.read.format("delta").load(BRONZE_PATH).count()
+    except Exception as e:
+        print(f"Error fetching bronze count for report: {e}")
+        
+    # 3. Get rows processed (Silver count)
+    try:
+        if os.path.exists(SILVER_PATH) and spark is not None:
+            report_data["rows_processed"] = spark.read.format("delta").load(SILVER_PATH).count()
+    except Exception as e:
+        print(f"Error fetching silver count for report: {e}")
+        
+    # Calculate rows rejected
+    report_data["rows_rejected"] = max(0, report_data["rows_received"] - report_data["rows_processed"])
+    
+    # 4. Fetch latest DQ Score & metrics
+    try:
+        if os.path.exists(DQ_METRICS_PATH) and spark is not None:
+            from pyspark.sql.functions import col
+            dq_df = spark.read.format("delta").load(DQ_METRICS_PATH).orderBy(col("validation_time").desc()).limit(1).toPandas()
+            if not dq_df.empty:
+                row = dq_df.iloc[0]
+                total_val = int(row["total_rows"])
+                null_ids = int(row.get("null_ids", 0))
+                invalid_ages = int(row.get("invalid_ages", 0))
+                duplicate_ids = int(row.get("duplicate_ids", 0))
+                
+                failed = null_ids + invalid_ages + duplicate_ids
+                passed = max(0, total_val - failed)
+                dq_score = (passed / total_val * 100) if total_val > 0 else 100.0
+                
+                report_data["dq_score"] = f"{dq_score:.1f}%"
+                report_data["null_ids"] = null_ids
+                report_data["invalid_ages"] = invalid_ages
+                report_data["duplicate_ids"] = duplicate_ids
+    except Exception as e:
+        print(f"Error fetching DQ metrics for report: {e}")
+        
+    # 5. Fetch Gold Layer metrics summary
+    try:
+        if os.path.exists(GOLD_PATH) and spark is not None:
+            gold_df = spark.read.format("delta").load(GOLD_PATH).toPandas()
+            if not gold_df.empty:
+                report_data["gold_summary"] = gold_df
+    except Exception as e:
+        print(f"Error fetching gold summary for report: {e}")
+        
+    return report_data
 
+
+def generate_txt_report(data):
+    """
+    Formulates a clean structured TXT report.
+    """
+    if not data:
+        return "No report data available."
+        
+    report = []
+    report.append("==================================================")
+    report.append("          GOLD ANALYTICS QUALITY REPORT           ")
+    report.append("==================================================")
+    report.append(f"Source Filename : {data.get('source_file')}")
+    report.append(f"Run ID          : {data.get('run_id')}")
+    report.append(f"Timestamp       : {data.get('timestamp')}")
+    report.append(f"Runtime         : {data.get('runtime')}")
+    report.append("--------------------------------------------------")
+    report.append(" DATA PROCESSING STATS:                           ")
+    report.append(f" - Rows Received : {data.get('rows_received'):,}")
+    report.append(f" - Rows Processed: {data.get('rows_processed'):,}")
+    report.append(f" - Rows Rejected : {data.get('rows_rejected'):,}")
+    report.append("--------------------------------------------------")
+    report.append(" DATA QUALITY SCORE:                              ")
+    report.append(f" - DQ Score      : {data.get('dq_score')}")
+    report.append(f" - Null IDs      : {data.get('null_ids'):,}")
+    report.append(f" - Duplicate IDs : {data.get('duplicate_ids'):,}")
+    report.append(f" - Invalid Ages  : {data.get('invalid_ages'):,}")
+    report.append("--------------------------------------------------")
+    report.append(" GOLD LAYER METRICS SUMMARY:                      ")
+    
+    gold_df = data.get("gold_summary")
+    if gold_df is not None and not gold_df.empty:
+        report.append(f"{'Processed Date':<18} | {'Average Age':<12} | {'Total Users':<12}")
+        report.append("-" * 50)
+        for _, row in gold_df.iterrows():
+            p_date = str(row.get("processed_date", "N/A"))
+            avg_age = f"{float(row.get('average_age', 0.0)):.2f}"
+            t_users = f"{int(row.get('total_users', 0)):,}"
+            report.append(f"{p_date:<18} | {avg_age:<12} | {t_users:<12}")
+    else:
+        report.append(" - No Gold layer metrics aggregated yet.")
+    report.append("==================================================")
+    
+    return "\n".join(report)
+
+
+def generate_pdf_report(data):
+    """
+    Generates a structured PDF document report using fpdf2 and returns its bytes.
+    """
+    if not data:
+        return b""
+        
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        return b""
+        
+    class PDF(FPDF):
+        def header(self):
+            self.set_font("Helvetica", "B", 16)
+            self.cell(0, 10, "Gold Analytics Quality Report", align="C", new_x="LMARGIN", new_y="NEXT")
+            self.ln(5)
+            self.line(10, 22, 200, 22)
+            self.ln(5)
+            
+        def footer(self):
+            self.set_y(-15)
+            self.set_font("Helvetica", "I", 8)
+            self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align="C")
+            
+    pdf = PDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=10)
+    
+    # Metadata section
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, "Execution Metadata", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", size=10)
+    pdf.cell(50, 6, "Source Filename:", new_x="RIGHT")
+    pdf.cell(0, 6, str(data.get("source_file")), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(50, 6, "Run ID:", new_x="RIGHT")
+    pdf.cell(0, 6, str(data.get("run_id")), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(50, 6, "Processing Timestamp:", new_x="RIGHT")
+    pdf.cell(0, 6, str(data.get("timestamp")), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(50, 6, "Run Duration:", new_x="RIGHT")
+    pdf.cell(0, 6, str(data.get("runtime")), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+    
+    # Data Processing Stats section
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, "Data Ingestion & Processing Stats", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", size=10)
+    pdf.cell(50, 6, "Rows Received (Raw):", new_x="RIGHT")
+    pdf.cell(0, 6, f"{data.get('rows_received'):,}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(50, 6, "Rows Processed (Silver):", new_x="RIGHT")
+    pdf.cell(0, 6, f"{data.get('rows_processed'):,}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(50, 6, "Rows Rejected:", new_x="RIGHT")
+    pdf.cell(0, 6, f"{data.get('rows_rejected'):,}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+    
+    # Data Quality Score section
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, "Data Quality & Audit Rules", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", size=10)
+    pdf.cell(50, 6, "Data Quality Score:", new_x="RIGHT")
+    pdf.cell(0, 6, str(data.get("dq_score")), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(50, 6, "Null ID Violations:", new_x="RIGHT")
+    pdf.cell(0, 6, f"{data.get('null_ids'):,}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(50, 6, "Duplicate ID Violations:", new_x="RIGHT")
+    pdf.cell(0, 6, f"{data.get('duplicate_ids'):,}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(50, 6, "Invalid Age Violations:", new_x="RIGHT")
+    pdf.cell(0, 6, f"{data.get('invalid_ages'):,}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+    
+    # Gold layer summary table
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, "Gold Layer Metrics Summary", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+    
+    gold_df = data.get("gold_summary")
+    if gold_df is not None and not gold_df.empty:
+        # Table Header
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(60, 8, "Processed Date", border=1, align="C", new_x="RIGHT")
+        pdf.cell(60, 8, "Average Age", border=1, align="C", new_x="RIGHT")
+        pdf.cell(60, 8, "Total Users", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+        
+        pdf.set_font("Helvetica", size=10)
+        for _, row in gold_df.iterrows():
+            p_date = str(row.get("processed_date", "N/A"))
+            avg_age = f"{float(row.get('average_age', 0.0)):.2f}"
+            t_users = f"{int(row.get('total_users', 0)):,}"
+            
+            pdf.cell(60, 7, p_date, border=1, align="C", new_x="RIGHT")
+            pdf.cell(60, 7, avg_age, border=1, align="C", new_x="RIGHT")
+            pdf.cell(60, 7, t_users, border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+    else:
+        pdf.set_font("Helvetica", "I", 10)
+        pdf.cell(0, 6, "No Gold metrics summary aggregated.", new_x="LMARGIN", new_y="NEXT")
+        
+    # Atomic export with NamedTemporaryFile to ensure safety
+    import tempfile
+    import os
+    pdf_bytes = b""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            pdf.output(tmp_path)
+            with open(tmp_path, "rb") as f:
+                pdf_bytes = f.read()
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    except Exception as e:
+        print(f"Error generating PDF: {str(e)}")
+        
+    return pdf_bytes
+
+
+# ============================================================
+# ENTERPRISE DATA QUALITY QUERIES
+# ============================================================
+
+@st.cache_data(ttl=30)
+def get_quarantine_data(_spark, run_id: str = None):
+    """
+    Retrieve quarantined rows from the quarantine Delta table.
+    If run_id is provided, filters to that specific run.
+    Returns a Pandas DataFrame or empty DataFrame.
+    """
+    import pandas as pd
+    try:
+        if not os.path.exists(QUARANTINE_PATH) or _spark is None:
+            return pd.DataFrame()
+        df = _spark.read.format("delta").load(QUARANTINE_PATH)
+        if run_id:
+            df = df.filter(df.run_id == run_id)
+        from pyspark.sql.functions import col as _col
+        result = df.orderBy(_col("quarantine_time").desc()).limit(500).toPandas()
+        return result
+    except Exception as e:
+        print(f"Error fetching quarantine data: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
+def get_profile_data(_spark, run_id: str = None):
+    """
+    Retrieve column profiling results from the data_profile Delta table.
+    Returns a Pandas DataFrame.
+    """
+    import pandas as pd
+    try:
+        if not os.path.exists(PROFILE_PATH) or _spark is None:
+            return pd.DataFrame()
+        df = _spark.read.format("delta").load(PROFILE_PATH)
+        if run_id:
+            df = df.filter(df.run_id == run_id)
+        else:
+            from pyspark.sql.functions import col as _col
+            latest = df.orderBy(_col("profile_time").desc()).limit(1).collect()
+            if latest:
+                latest_run = latest[0]["run_id"]
+                df = df.filter(df.run_id == latest_run)
+        return df.toPandas()
+    except Exception as e:
+        print(f"Error fetching profile data: {e}")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
+def get_dq_run_report(_spark, run_id: str = None):
+    """
+    Retrieve the DQ run report scorecard from the dq_run_report Delta table.
+    Returns a dict with the latest run's metrics.
+    """
+    import pandas as pd
+    try:
+        if not os.path.exists(DQ_REPORT_PATH) or _spark is None:
+            return None
+        from pyspark.sql.functions import col as _col
+        df = _spark.read.format("delta").load(DQ_REPORT_PATH)
+        if run_id:
+            df = df.filter(df.run_id == run_id)
+        order_col = "report_time" if "report_time" in df.columns else "processed_at"
+        latest = df.orderBy(_col(order_col).desc()).limit(1).toPandas()
+        if latest.empty:
+            return None
+        return latest.iloc[0].to_dict()
+    except Exception as e:
+        print(f"Error fetching DQ run report: {e}")
+        return None
+
+
+@st.cache_data(ttl=60)
+def get_schema_mapping_log(_spark, run_id: str = None):
+    """
+    Retrieve schema mapping log entries from the schema_mapping_log Delta table.
+    Returns a Pandas DataFrame.
+    """
+    import pandas as pd
+    try:
+        if not os.path.exists(SCHEMA_MAP_LOG_PATH) or _spark is None:
+            return pd.DataFrame()
+        df = _spark.read.format("delta").load(SCHEMA_MAP_LOG_PATH)
+        if run_id:
+            df = df.filter(df.run_id == run_id)
+        return df.orderBy(df.mapping_time.desc()).limit(20).toPandas()
+    except Exception as e:
+        print(f"Error fetching schema mapping log: {e}")
+        return pd.DataFrame()
+
+
+def get_latest_successful_run_id():
+    """Read the latest completed run_id from the HISTORY_FILE."""
+    if not os.path.exists(HISTORY_FILE):
+        return None
+    try:
+        with open(HISTORY_FILE) as f:
+            lines = [json.loads(l.strip()) for l in f if l.strip()]
+        for rec in reversed(lines):
+            if rec.get("status") == "completed":
+                return rec.get("run_id")
+    except Exception:
+        pass
+    return None
