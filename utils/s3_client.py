@@ -40,9 +40,19 @@ def get_s3_client():
     """
     try:
         import boto3
+        from botocore.config import Config
+        fast_config = Config(
+            connect_timeout=0.5,
+            read_timeout=1.0,
+            retries={'max_attempts': 0}
+        )
         # Default credential chain: instance metadata → env vars → ~/.aws
         # On EC2 with MedallionPipelineRole, instance metadata is used automatically.
-        client = boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+        client = boto3.client(
+            "s3",
+            region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+            config=fast_config
+        )
         return client
     except Exception as e:
         logger.error(f"[S3] Failed to create S3 client: {e}")

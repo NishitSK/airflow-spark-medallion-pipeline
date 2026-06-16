@@ -76,7 +76,10 @@ def transform_silver(spark=None, valid_df: DataFrame = None, row_count: int = No
             .withColumn("name", name_col)
 
         # Deduplicate on ID (safety net for any edge cases the DQ engine may miss)
-        final_df = transformed_df.dropDuplicates(["id"])
+        if valid_df is not None:
+            final_df = transformed_df
+        else:
+            final_df = transformed_df.dropDuplicates(["id"])
 
         # Add processed_date partition column
         final_df = final_df.withColumn("processed_date", to_date("ingestion_time"))

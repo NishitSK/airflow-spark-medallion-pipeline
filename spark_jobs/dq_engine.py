@@ -7,7 +7,7 @@ The pipeline NEVER silently discards data.
 """
 import os
 import yaml
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.functions import (
     col, trim, regexp_replace, when, lit, array, array_remove,
@@ -90,12 +90,11 @@ def run_dq_engine(df: DataFrame, run_id: str = "unknown", source_file: str = "un
     )
 
     # ---- Duplicate detection on normalized ID (batch-level) ----
-    non_null_ids = tagged_df.filter(~is_null_id & ~is_malformed_id)
-    id_counts = non_null_ids.groupBy("__norm_id").agg(F.count("*").alias("__id_count"))
-    tagged_df = tagged_df.join(id_counts, on="__norm_id", how="left")
+    windowSpec = Window.partitionBy("__norm_id")
+    tagged_df = tagged_df.withColumn("__id_count", F.count("*").over(windowSpec))
     tagged_df = tagged_df.withColumn(
         "__is_duplicate",
-        col("__id_count").isNotNull() & (col("__id_count") > 1)
+        (~is_null_id) & (~is_malformed_id) & (col("__id_count") > 1)
     )
     tagged_df = tagged_df.withColumn(
         "__violations",

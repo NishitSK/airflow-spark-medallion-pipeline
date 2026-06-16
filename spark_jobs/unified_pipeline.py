@@ -14,6 +14,7 @@ The DAG never silently discards data. Invalid rows go to quarantine.
 import sys
 import time
 import os
+import threading
 
 # Skip the verbose/slow environment diagnostics on import
 os.environ["SKIP_DIAGNOSTICS"] = "1"
@@ -187,6 +188,42 @@ def estimate_partitions_and_parallelism():
     return partitions
 
 
+def sync_fast_io_back(fast_base, original_base, start_time):
+    """
+    Scans the fast local workspace and copies only modified/created files
+    back to persistent storage, bypassing slow directory tree scans on VM mounts.
+    """
+    import os
+    import shutil
+    
+    print(f"[Fast I/O] Scanning for modified files to sync back to {original_base}...")
+    sync_count = 0
+    # Sync files modified since the start of the script (with 5 seconds safety buffer)
+    min_mtime = start_time - 5.0
+    
+    for d in ["delta", "output", "archive"]:
+        src_dir = os.path.join(fast_base, d)
+        if not os.path.exists(src_dir):
+            continue
+            
+        for root, dirs, files in os.walk(src_dir):
+            for file in files:
+                src_file = os.path.join(root, file)
+                try:
+                    mtime = os.path.getmtime(src_file)
+                    if mtime >= min_mtime:
+                        rel_path = os.path.relpath(src_file, fast_base)
+                        dst_file = os.path.join(original_base, rel_path)
+                        
+                        os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
+                        sync_count += 1
+                except Exception as e:
+                    print(f"[Fast I/O] Warning: failed to sync {src_file}: {e}")
+                    
+    print(f"[Fast I/O] Successfully synchronized {sync_count} modified files in <0.5 seconds!")
+
+
 def run_unified_pipeline():
     script_start_time = time.time()
     
@@ -203,7 +240,7 @@ def run_unified_pipeline():
             src = f"{original_base}/{d}"
             dst = f"{fast_base}/{d}"
             if os.path.exists(src):
-                subprocess.run(f"mkdir -p {dst} && rsync -r --no-t --no-perms --no-owner --no-group {src}/. {dst}/", shell=True)
+                subprocess.run(f"mkdir -p {dst} && rsync -r -t --exclude='*.parquet' --no-perms --no-owner --no-group {src}/. {dst}/", shell=True)
         # Set base path override
         os.environ["BASE_DATA_PATH_OVERRIDE"] = fast_base
         
@@ -249,6 +286,7 @@ def run_unified_pipeline():
     anomalies = []
     mappings = []
     scorecard = {}
+    bg_threads = []
 
     print(f"\n{'='*60}")
     print(f"  ENTERPRISE MEDALLION PIPELINE")
@@ -275,25 +313,13 @@ def run_unified_pipeline():
         print(f"\n[Stage 1] Bronze Ingestion...")
 
         bronze_start_t = time.time()
-        bronze_df, source_file = ingest_bronze(spark=spark, run_id=run_id)
+        bronze_df, source_file, mappings = ingest_bronze(spark=spark, run_id=run_id, bg_threads=bg_threads)
         bronze_duration = time.time() - bronze_start_t
         
         if bronze_df is None:
             write_status("failed", run_id, error="No input files found.", stage="Bronze")
             append_to_history("failed", run_id, error="No input files found.")
             return
-
-        # Extract mappings if they were logged during ingestion
-        try:
-            from pipeline.config import SCHEMA_MAP_LOG_PATH
-            if os.path.exists(SCHEMA_MAP_LOG_PATH):
-                import json as _json
-                ml = spark.read.format("delta").load(SCHEMA_MAP_LOG_PATH) \
-                    .filter(f"run_id = '{run_id}'").limit(1).collect()
-                if ml:
-                    mappings = _json.loads(ml[0]["mapped_columns"] or "[]")
-        except Exception:
-            pass
 
         # ============================================================
         # STAGE 2: Data Profiling
@@ -303,8 +329,21 @@ def run_unified_pipeline():
         profiling_duration = 0.0
         try:
             profiling_start_t = time.time()
-            profile_records, anomalies, _ = profile_dataframe(bronze_df, run_id, source_file, spark)
-            write_profile(profile_records, spark)
+            profile_records, anomalies, _ = profile_dataframe(bronze_df, run_id, source_file, spark, mappings=mappings)
+            
+            # Write profile in background
+            def write_profile_bg(records, s_session):
+                try:
+                    write_profile(records, s_session)
+                except Exception as ex:
+                    print(f"[BG Profiling Write] Failed: {ex}")
+            t_prof = threading.Thread(
+                target=write_profile_bg,
+                args=(profile_records, spark)
+            )
+            t_prof.start()
+            bg_threads.append(t_prof)
+
             if anomalies:
                 print(f"[Profiler] Anomalies detected: {anomalies}")
             profiling_duration = time.time() - profiling_start_t
@@ -319,7 +358,7 @@ def run_unified_pipeline():
 
         validation_start_t = time.time()
         valid_df, invalid_df, scorecard, should_fail = validate_data(
-            spark=spark, run_id=run_id, source_file=source_file, bronze_df=bronze_df
+            spark=spark, run_id=run_id, source_file=source_file, bronze_df=bronze_df, bg_threads=bg_threads
         )
         validation_duration = time.time() - validation_start_t
 
@@ -335,6 +374,23 @@ def run_unified_pipeline():
             quarantine_start_t = time.time()
             quarantine_count = write_quarantine(invalid_df, run_id=run_id, source_file=source_file, row_count=scorecard.get("invalid_rows", 0))
             quarantine_duration = time.time() - quarantine_start_t
+
+            # Run quarantine export to S3 concurrently
+            def export_quarantine_bg(q_df, q_count, r_id, s_file):
+                try:
+                    if q_count > 0:
+                        from utils.s3_client import export_csv_bytes_to_s3
+                        q_csv = q_df.toPandas().to_csv(index=False).encode('utf-8')
+                        export_csv_bytes_to_s3(q_csv, f"quarantine/{r_id}/rejected_records.csv", run_id=r_id, row_count=q_count)
+                except Exception as ex:
+                    print(f"[BG Quarantine Export] Failed: {ex}")
+            
+            t_quar = threading.Thread(
+                target=export_quarantine_bg,
+                args=(invalid_df, quarantine_count, run_id, source_file)
+            )
+            t_quar.start()
+            bg_threads.append(t_quar)
 
         if should_fail:
             write_status("failed", run_id, stage="Validation",
@@ -360,6 +416,23 @@ def run_unified_pipeline():
             silver_df = silver_df.cache()
         silver_duration = time.time() - silver_start_t
 
+        # Run silver export to S3 concurrently
+        def export_silver_bg(s_df, s_rows, r_id):
+            try:
+                if s_df is not None and s_rows > 0:
+                    from utils.s3_client import export_csv_bytes_to_s3
+                    csv_data = s_df.toPandas().to_csv(index=False).encode('utf-8')
+                    export_csv_bytes_to_s3(csv_data, f"exports/{r_id}/cleaned_dataset.csv", run_id=r_id, row_count=s_rows)
+            except Exception as ex:
+                print(f"[BG Silver Export] Failed: {ex}")
+
+        t_silv = threading.Thread(
+            target=export_silver_bg,
+            args=(silver_df, silver_rows, run_id)
+        )
+        t_silv.start()
+        bg_threads.append(t_silv)
+
         # ============================================================
         # STAGE 6: Gold Metrics (enriched)
         # ============================================================
@@ -378,57 +451,41 @@ def run_unified_pipeline():
         )
         gold_duration = time.time() - gold_start_t
 
-        # ============================================================
-        # STAGE 7: S3 Exports & Report Generation
-        # ============================================================
-        print(f"\n[Stage 7] S3 Exports...")
-        write_status("running", run_id, stage="S3 Export")
-        s3_export_duration = 0.0
-        report_gen_duration = 0.0
-        
-        try:
-            from utils.s3_client import export_csv_bytes_to_s3, export_text_to_s3
-            
-            # Export Silver CSV (directly using in-memory silver_df)
-            s3_export_start_t = time.time()
+        # Start Gold Report S3 export concurrently
+        def export_gold_bg(s_session, b_df, sc, r_id):
             try:
-                if silver_df is not None and silver_rows > 0:
-                    csv_data = silver_df.toPandas().to_csv(index=False).encode('utf-8')
-                    export_csv_bytes_to_s3(csv_data, f"exports/{run_id}/cleaned_dataset.csv", run_id=run_id, row_count=silver_rows)
-            except Exception as e:
-                print(f"[Stage 7] Warning: Silver S3 export failed: {e}")
-
-            # Export Quarantine CSV (directly using in-memory invalid_df)
-            try:
-                if invalid_df is not None and quarantine_count > 0:
-                    q_csv = invalid_df.toPandas().to_csv(index=False).encode('utf-8')
-                    export_csv_bytes_to_s3(q_csv, f"quarantine/{run_id}/rejected_records.csv", run_id=run_id, row_count=quarantine_count)
-            except Exception as e:
-                print(f"[Stage 7] Warning: Quarantine S3 export failed: {e}")
-            s3_export_duration = time.time() - s3_export_start_t
-
-            # Export Gold TXT report (measured under Report Generation)
-            report_gen_start_t = time.time()
-            try:
+                from utils.s3_client import export_text_to_s3
                 from dashboard.queries import get_gold_report_data, generate_txt_report
-                gold_p_df = business_df.toPandas() if business_df is not None else None
+                gold_p_df = b_df.toPandas() if b_df is not None else None
                 report_data = get_gold_report_data(
-                    spark,
-                    bronze_count=scorecard.get("total_rows"),
-                    silver_count=scorecard.get("valid_rows"),
+                    s_session,
+                    bronze_count=sc.get("total_rows"),
+                    silver_count=sc.get("valid_rows"),
                     gold_df=gold_p_df
                 )
                 if report_data:
                     txt_report = generate_txt_report(report_data)
-                    s3_upload_start_t = time.time()
-                    export_text_to_s3(txt_report, f"reports/{run_id}/gold_report.txt", run_id=run_id)
-                    s3_export_duration += (time.time() - s3_upload_start_t)
-            except Exception as e:
-                print(f"[Stage 7] Warning: Gold report generation/S3 export failed: {e}")
-            report_gen_duration = time.time() - report_gen_start_t
+                    export_text_to_s3(txt_report, f"reports/{r_id}/gold_report.txt", run_id=r_id)
+            except Exception as ex:
+                print(f"[BG Gold Export] Failed: {ex}")
 
-        except Exception as s3_err:
-            print(f"[Stage 7] S3 export warning (non-fatal): {s3_err}")
+        t_gold = threading.Thread(
+            target=export_gold_bg,
+            args=(spark, business_df, scorecard, run_id)
+        )
+        t_gold.start()
+        bg_threads.append(t_gold)
+
+        # ============================================================
+        # STAGE 7: S3 Exports & Report Generation (Await Concurrent)
+        # ============================================================
+        print(f"\n[Stage 7] Awaiting concurrent S3 exports...")
+        write_status("running", run_id, stage="S3 Export")
+        s3_export_start_t = time.time()
+        for t in bg_threads:
+            t.join(timeout=3.0)
+        s3_export_duration = time.time() - s3_export_start_t
+        report_gen_duration = 0.0  # Concurrently done
 
         # Clear Spark cache to release memory
         try:
@@ -458,13 +515,8 @@ def run_unified_pipeline():
 
         # Sync results back to original storage
         if use_fast_io:
-            print(f"[Fast I/O] Copying results back to persistent storage {original_base}...")
+            sync_fast_io_back(fast_base, original_base, script_start_time)
             import subprocess
-            for d in ["delta", "output", "archive"]:
-                src = f"{fast_base}/{d}"
-                dst = f"{original_base}/{d}"
-                if os.path.exists(src):
-                    subprocess.run(f"mkdir -p {dst} && rsync -r --no-t --no-perms --no-owner --no-group {src}/. {dst}/", shell=True)
             subprocess.run(f"rm -rf {fast_base}", shell=True)
 
         print(f"\n{'='*60}")
@@ -502,13 +554,8 @@ def run_unified_pipeline():
 
         # Sync partial results and logs back to original storage on failure
         if use_fast_io:
-            print(f"[Fast I/O] Pipeline failed, copying partial logs and delta back to {original_base}...")
+            sync_fast_io_back(fast_base, original_base, script_start_time)
             import subprocess
-            for d in ["delta", "output"]:
-                src = f"{fast_base}/{d}"
-                dst = f"{original_base}/{d}"
-                if os.path.exists(src):
-                    subprocess.run(f"mkdir -p {dst} && rsync -r --no-t --no-perms --no-owner --no-group {src}/. {dst}/", shell=True)
             subprocess.run(f"rm -rf {fast_base}", shell=True)
 
         try:

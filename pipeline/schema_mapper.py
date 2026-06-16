@@ -74,13 +74,14 @@ def apply_schema_mapping(df: DataFrame, run_id: str = "unknown", source_file: st
 
 
 def _log_mappings(mappings, unresolved, run_id, source_file, spark):
-    """Append schema mapping log to the schema_mapping_log Delta table."""
+    """Append schema mapping log directly using Pandas to avoid Spark job overhead."""
     try:
         import time
-        from pyspark.sql.types import StructType, StructField, StringType, ArrayType
-        from pipeline.config import SCHEMA_MAP_LOG_PATH
-        from pipeline.delta_utils import write_delta
+        import os
+        import pandas as pd
+        import uuid
         import json
+        from pipeline.config import SCHEMA_MAP_LOG_PATH
 
         records = [{
             "run_id": run_id,
@@ -89,8 +90,11 @@ def _log_mappings(mappings, unresolved, run_id, source_file, spark):
             "unresolved_columns": json.dumps(unresolved),
             "mapping_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         }]
-        log_df = spark.createDataFrame(records)
-        write_delta(log_df, SCHEMA_MAP_LOG_PATH, mode="append")
+        
+        os.makedirs(SCHEMA_MAP_LOG_PATH, exist_ok=True)
+        pdf = pd.DataFrame(records)
+        # Write directly to a unique parquet file in the path
+        pdf.to_parquet(os.path.join(SCHEMA_MAP_LOG_PATH, f"part-py-{uuid.uuid4().hex}.snappy.parquet"), index=False)
     except Exception as e:
         print(f"[SchemaMapper] Warning: Could not write mapping log: {e}")
 

@@ -12,7 +12,7 @@ from pipeline.config import BRONZE_PATH, INPUT_PATH, SPARK_LOG_LEVEL
 from pipeline.delta_utils import get_spark_session, write_delta
 
 
-def ingest_bronze(spark=None, run_id="unknown"):
+def ingest_bronze(spark=None, run_id="unknown", bg_threads=None):
     own_spark = False
     if spark is None:
         spark = get_spark_session("BronzeIngestion")
@@ -22,11 +22,16 @@ def ingest_bronze(spark=None, run_id="unknown"):
 
     # Read files with no schema enforcement — accept anything
     try:
+        mappings = []
         df_csv = None
         df_json = None
 
         csv_files = [f for f in os.listdir(INPUT_PATH) if f.endswith('.csv')] if os.path.exists(INPUT_PATH) else []
         json_files = [f for f in os.listdir(INPUT_PATH) if f.endswith('.json')] if os.path.exists(INPUT_PATH) else []
+
+        # Ingest timing
+        import time
+        bronze_t0 = time.time()
 
         if csv_files:
             try:
@@ -65,12 +70,15 @@ def ingest_bronze(spark=None, run_id="unknown"):
             print("[Bronze] No CSV or JSON files found in input path.")
             return None, "unknown"
 
+        print(f"[Bronze Timing] Reading files took: {time.time() - bronze_t0:.2f} seconds")
+
         # Add ingestion metadata
         df = df \
             .withColumn("ingestion_time", current_timestamp()) \
             .withColumn("source_file", input_file_name())
 
         # Apply schema mapping (alias resolution)
+        map_t0 = time.time()
         try:
             from pipeline.schema_mapper import apply_schema_mapping
             source_file = csv_files[0] if csv_files else (json_files[0] if json_files else "unknown")
@@ -81,18 +89,27 @@ def ingest_bronze(spark=None, run_id="unknown"):
                 print(f"[Bronze] Warning — unresolved columns (kept as-is): {unresolved}")
         except Exception as schema_err:
             print(f"[Bronze] Warning: Schema mapping failed: {schema_err}")
+        print(f"[Bronze Timing] Schema mapping took: {time.time() - map_t0:.2f} seconds")
 
-        df = df.cache()
-        row_count = df.count()
-        if row_count > 0:
-            write_delta(df, BRONZE_PATH, mode="overwrite")
-            source_file = csv_files[0] if csv_files else (json_files[0] if json_files else "unknown")
-            print(f"[Bronze] Ingestion Success: {row_count} rows | Source: {source_file}")
-            return df, source_file
+        write_t0 = time.time()
+        import threading
+        def write_bronze_bg():
+            try:
+                write_delta(df, BRONZE_PATH, mode="overwrite")
+                print(f"[BG Bronze Write] Delta table overwrite complete.")
+            except Exception as e:
+                print(f"[BG Bronze Write] Error: {e}")
+                
+        t_bronze = threading.Thread(target=write_bronze_bg)
+        t_bronze.start()
+        if bg_threads is not None:
+            bg_threads.append(t_bronze)
         else:
-            print("[Bronze] Input files were empty.")
-            df.unpersist()
-            return None, "unknown"
+            t_bronze.join()
+            
+        source_file = csv_files[0] if csv_files else (json_files[0] if json_files else "unknown")
+        print(f"[Bronze Timing] Launched Bronze Delta write in background | Source: {source_file}")
+        return df, source_file, mappings
 
     except Exception as e:
         print(f"[Bronze] Ingestion Failed: {str(e)}")

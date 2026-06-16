@@ -6,95 +6,123 @@ Detects anomalies by comparing against the previous run's profile.
 Results are stored in the data_profile Delta table.
 """
 import os
+import pandas as pd
+import numpy as np
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.functions import col, count, when, isnan, lit, current_timestamp
+from pyspark.sql.functions import col, current_timestamp
 from pipeline.config import PROFILE_PATH
 from pipeline.delta_utils import write_delta
 
 
-def profile_dataframe(df: DataFrame, run_id: str, source_file: str, spark: SparkSession):
+def profile_dataframe(df: DataFrame, run_id: str, source_file: str, spark: SparkSession, mappings: list = None):
     """
-    Compute statistical profile for each column.
+    Compute statistical profile for each column using vectorized Pandas operations.
     Returns a list of profile records and detected anomalies.
     """
+    import time
+    start_time = time.time()
     profile_records = []
     anomalies = []
     
-    total_rows = df.count()
+    # 1. Try to read directly from input path using Pandas to avoid JVM serialization overhead
+    pdf = None
+    topandas_dur = 0.0
+    if mappings is not None:
+        try:
+            topandas_start = time.time()
+            from pipeline.config import INPUT_PATH
+            csv_files = [f for f in os.listdir(INPUT_PATH) if f.endswith('.csv')] if os.path.exists(INPUT_PATH) else []
+            json_files = [f for f in os.listdir(INPUT_PATH) if f.endswith('.json')] if os.path.exists(INPUT_PATH) else []
+            
+            pdf_list = []
+            for f in csv_files:
+                pdf_list.append(pd.read_csv(os.path.join(INPUT_PATH, f), dtype=str))
+            for f in json_files:
+                pdf_list.append(pd.read_json(os.path.join(INPUT_PATH, f), lines=True, dtype=str))
+                
+            if len(pdf_list) > 1:
+                pdf = pd.concat(pdf_list, ignore_index=True)
+            elif len(pdf_list) == 1:
+                pdf = pdf_list[0]
+            else:
+                pdf = pd.DataFrame()
+                
+            if not pdf.empty:
+                rename_dict = {m["from_col"]: m["to_col"] for m in mappings}
+                pdf.rename(columns=rename_dict, inplace=True)
+                topandas_dur = time.time() - topandas_start
+                print(f"[Profiler Timing] Pandas raw read took: {topandas_dur:.2f} seconds")
+        except Exception as e:
+            print(f"[Profiler] Warning: Direct Pandas load failed (falling back to toPandas): {e}")
+            pdf = None
+
+    if pdf is None:
+        topandas_start = time.time()
+        pdf = df.toPandas()
+        topandas_dur = time.time() - topandas_start
+        print(f"[Profiler Timing] df.toPandas() took: {topandas_dur:.2f} seconds")
+    
+    calc_start = time.time()
+    total_rows = len(pdf)
     if total_rows == 0:
         return [], [], 0
 
-    columns_to_profile = [c for c in df.columns if c not in ("ingestion_time", "source_file")]
+    columns_to_profile = [c for c in pdf.columns if c not in ("ingestion_time", "source_file")]
 
-    # 1. Single aggregation pass for all standard stats
-    agg_exprs = []
     for c in columns_to_profile:
-        # Null count
-        agg_exprs.append(F.sum(F.when(col(c).isNull() | (F.trim(col(c)) == ""), 1).otherwise(0)).alias(f"null_cnt_{c}"))
-        # Distinct count
-        agg_exprs.append(F.countDistinct(col(c)).alias(f"distinct_cnt_{c}"))
-        # Numeric stats (cast to double)
-        num_col = col(c).cast("double")
-        agg_exprs.append(F.min(num_col).alias(f"min_{c}"))
-        agg_exprs.append(F.max(num_col).alias(f"max_{c}"))
-        agg_exprs.append(F.avg(num_col).alias(f"avg_{c}"))
-        agg_exprs.append(F.stddev(num_col).alias(f"stddev_{c}"))
-
-    stats_row = df.agg(*agg_exprs).collect()[0]
-
-    # 2. Extract stats and determine bounds for outlier pass
-    bounds = {}
-    outlier_exprs = []
-    for c in columns_to_profile:
-        mean_val = stats_row[f"avg_{c}"]
-        stddev_val = stats_row[f"stddev_{c}"]
-        if mean_val is not None and stddev_val is not None and stddev_val > 0:
-            lower = mean_val - 3 * stddev_val
-            upper = mean_val + 3 * stddev_val
-            bounds[c] = (lower, upper, mean_val, stddev_val)
-            num_col = col(c).cast("double")
-            outlier_exprs.append(
-                F.sum(F.when((num_col < lower) | (num_col > upper), 1).otherwise(0)).alias(f"outliers_{c}")
-            )
-        else:
-            bounds[c] = None
-
-    # 3. Single aggregation pass for all outliers
-    outliers_row = None
-    if outlier_exprs:
-        outliers_row = df.agg(*outlier_exprs).collect()[0]
-
-    # 4. Generate profile records
-    for c in columns_to_profile:
-        null_count = stats_row[f"null_cnt_{c}"] or 0
+        series = pdf[c]
+        
+        # Spark checks col(c).isNull() | (trim(col(c)) == "")
+        is_null = series.isna()
+        if series.dtype == object:
+            trimmed = series.astype(str).str.strip()
+            is_null = is_null | (trimmed == "") | (trimmed == "None") | (trimmed == "nan") | (trimmed == "NaN")
+        
+        null_count = int(is_null.sum())
         null_pct = round(null_count / total_rows * 100, 2) if total_rows > 0 else 0.0
 
-        distinct_count = stats_row[f"distinct_cnt_{c}"] or 0
+        # Unique count distinct non-null
+        valid_series = series[~is_null]
+        distinct_count = int(valid_series.nunique())
+        
         dup_count = total_rows - distinct_count
         dup_pct = round(dup_count / total_rows * 100, 2) if total_rows > 0 else 0.0
 
-        # Top 5 values
-        top_values = []
-        try:
-            top_df = df.groupBy(col(c)).count().orderBy(F.desc("count")).limit(5)
-            top_values = [str(r[c]) for r in top_df.collect()]
-        except Exception:
-            pass
+        # Numeric stats: cast to float
+        num_series = pd.to_numeric(series, errors='coerce')
+        num_series_clean = num_series.dropna()
 
-        min_val = stats_row[f"min_{c}"]
-        max_val = stats_row[f"max_{c}"]
-        mean_val = round(stats_row[f"avg_{c}"], 2) if stats_row[f"avg_{c}"] is not None else None
-        stddev_val = round(stats_row[f"stddev_{c}"], 2) if stats_row[f"stddev_{c}"] is not None else None
-
+        min_val = None
+        max_val = None
+        mean_val = None
+        stddev_val = None
         outlier_count = 0
-        if bounds[c] and outliers_row:
-            outlier_count = outliers_row[f"outliers_{c}"] or 0
-            if outlier_count > 0:
-                lower, upper, _, _ = bounds[c]
-                anomalies.append(
-                    f"Column '{c}': {outlier_count} outlier(s) detected (outside [{lower:.1f}, {upper:.1f}])"
-                )
+
+        if not num_series_clean.empty:
+            min_val = num_series_clean.min()
+            max_val = num_series_clean.max()
+            mean_val = num_series_clean.mean()
+            stddev_val = num_series_clean.std()
+            
+            # Outliers: mean +/- 3*stddev
+            if stddev_val is not None and stddev_val > 0:
+                lower = mean_val - 3 * stddev_val
+                upper = mean_val + 3 * stddev_val
+                outliers_mask = (num_series_clean < lower) | (num_series_clean > upper)
+                outlier_count = int(outliers_mask.sum())
+                if outlier_count > 0:
+                    anomalies.append(
+                        f"Column '{c}': {outlier_count} outlier(s) detected (outside [{lower:.1f}, {upper:.1f}])"
+                    )
+
+        # Top 5 values by count descending
+        series_with_none = series.copy()
+        if is_null.any():
+            series_with_none[is_null] = "None"
+            
+        top_series = series_with_none.value_counts(dropna=False).head(5)
+        top_values = [str(k) for k in top_series.index]
 
         profile_records.append({
             "run_id":          run_id,
@@ -108,17 +136,23 @@ def profile_dataframe(df: DataFrame, run_id: str, source_file: str, spark: Spark
             "duplicate_pct":   float(dup_pct),
             "min_value":       str(min_val) if min_val is not None else None,
             "max_value":       str(max_val) if max_val is not None else None,
-            "mean_value":      str(mean_val) if mean_val is not None else None,
-            "stddev_value":    str(stddev_val) if stddev_val is not None else None,
+            "mean_value":      str(round(mean_val, 2)) if mean_val is not None else None,
+            "stddev_value":    str(round(stddev_val, 2)) if stddev_val is not None else None,
             "outlier_count":   float(outlier_count),
             "top_values":      ", ".join(top_values),
         })
 
-    # Volume anomaly detection vs previous run
-    anomalies += _detect_volume_anomalies(spark, total_rows, run_id)
-    
-    # Clean cache done by caller
+    calc_dur = time.time() - calc_start
+    print(f"[Profiler Timing] Pandas calculations took: {calc_dur:.2f} seconds")
 
+    # Volume anomaly detection vs previous run
+    vol_start = time.time()
+    anomalies += _detect_volume_anomalies(spark, total_rows, run_id)
+    vol_dur = time.time() - vol_start
+    print(f"[Profiler Timing] Volume anomaly detection took: {vol_dur:.2f} seconds")
+    
+    total_dur = time.time() - start_time
+    print(f"[Profiler Timing] Total profiling function took: {total_dur:.2f} seconds")
     return profile_records, anomalies, total_rows
 
 
@@ -138,6 +172,33 @@ def write_profile(profile_records: list, spark: SparkSession):
 def _detect_volume_anomalies(spark: SparkSession, current_rows: int, run_id: str):
     """Compare current row count against the last profile to detect volume anomalies."""
     anomalies = []
+    
+    # Try reading from pipeline_history.jsonl first (extremely fast, avoids Spark jobs)
+    try:
+        from pipeline.config import HISTORY_FILE
+        if os.path.exists(HISTORY_FILE):
+            import json
+            prev_rows = None
+            with open(HISTORY_FILE, "r") as f:
+                for line in reversed(f.readlines()):
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    if rec.get("status") == "completed" and rec.get("run_id") != run_id:
+                        prev_rows = int(rec.get("rows", 0))
+                        break
+            if prev_rows is not None and prev_rows > 0:
+                ratio = current_rows / prev_rows
+                if ratio < 0.70:
+                    anomalies.append(f"Volume DROP: {current_rows:,} rows vs previous {prev_rows:,} ({ratio:.0%})")
+                elif ratio > 2.0:
+                    anomalies.append(f"Volume SPIKE: {current_rows:,} rows vs previous {prev_rows:,} ({ratio:.0%})")
+                print(f"[Profiler Volume Check] Read history from file: prev_rows = {prev_rows}")
+                return anomalies
+    except Exception as e:
+        print(f"[Profiler Volume Check] History file read failed: {e}")
+
+    # Fallback to Delta Spark read
     try:
         if not os.path.exists(PROFILE_PATH):
             return anomalies
@@ -158,3 +219,4 @@ def _detect_volume_anomalies(spark: SparkSession, current_rows: int, run_id: str
     except Exception:
         pass
     return anomalies
+

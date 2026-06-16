@@ -26,7 +26,7 @@ def _load_config():
     return {}
 
 
-def validate_data(spark=None, run_id="unknown", source_file="unknown", bronze_df=None):
+def validate_data(spark=None, run_id="unknown", source_file="unknown", bronze_df=None, bg_threads=None):
     """
     Runs enterprise row-level DQ on Bronze data.
     Returns: (valid_df, invalid_df, scorecard, should_fail)
@@ -50,11 +50,20 @@ def validate_data(spark=None, run_id="unknown", source_file="unknown", bronze_df
         # Run enterprise DQ engine
         valid_df, invalid_df, scorecard = run_dq_engine(df, run_id=run_id, source_file=source_file)
 
-        # Persist DQ scorecard
-        write_dq_scorecard(scorecard, spark)
+        # Persist DQ scorecard and metrics in background
+        import threading
+        t1 = threading.Thread(target=write_dq_scorecard, args=(scorecard, spark))
+        t1.start()
+        
+        t2 = threading.Thread(target=_write_legacy_dq_metrics, args=(scorecard, spark))
+        t2.start()
 
-        # Write legacy DQ metrics for backward-compatible dashboard queries
-        _write_legacy_dq_metrics(scorecard, spark)
+        if bg_threads is not None:
+            bg_threads.append(t1)
+            bg_threads.append(t2)
+        else:
+            t1.join()
+            t2.join()
 
         # Check thresholds
         config = _load_config()

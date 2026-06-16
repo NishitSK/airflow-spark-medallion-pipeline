@@ -21,6 +21,8 @@ def get_spark_session(app_name="MedallionPipeline", shuffle_partitions=1):
         .config("spark.driver.memory", "512m") \
         .config("spark.ui.enabled", "false") \
         .config("spark.sql.adaptive.enabled", "false") \
+        .config("spark.sql.parquet.compression.codec", "none") \
+        .config("spark.databricks.delta.properties.defaults.checkpointInterval", "100") \
         .getOrCreate()
 
 def read_delta(spark, path):
