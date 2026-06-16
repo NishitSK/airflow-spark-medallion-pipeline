@@ -11,6 +11,37 @@ from spark_jobs.gold_metrics import generate_gold
 from monitoring.log_incident import log_incident
 
 
+def log_diagnostics(file_path):
+    import os
+    import logging
+    from pathlib import Path
+    
+    logger = logging.getLogger("ResilientWriter")
+    uid = None
+    gid = None
+    try:
+        uid = os.getuid()
+        gid = os.getgid()
+    except AttributeError:
+        pass
+        
+    path = Path(file_path)
+    parent_dir = path.parent
+    path_exists = path.exists()
+    target_to_check = str(path) if path_exists else str(parent_dir)
+    is_writable = os.access(target_to_check, os.W_OK)
+    
+    msg = (
+        f"[DIAGNOSTICS] Writing to: {file_path} | "
+        f"Parent exists: {parent_dir.exists()} | "
+        f"File exists: {path_exists} | "
+        f"UID: {uid} | GID: {gid} | "
+        f"Writable: {is_writable}"
+    )
+    logger.warning(msg)
+    print(msg)
+
+
 def write_status(status, run_id, file_name=None, error=None, duration=None, stage=None):
     # Detect file in input if not passed
     if not file_name and os.path.exists(INPUT_PATH):
@@ -41,6 +72,11 @@ def write_status(status, run_id, file_name=None, error=None, duration=None, stag
         "duration": f"{duration:.2f}" if duration is not None else None
     }
     try:
+        log_diagnostics(STATUS_FILE)
+    except Exception as diag_err:
+        print(f"Diagnostics error: {str(diag_err)}")
+        
+    try:
         from pathlib import Path
         Path(STATUS_FILE).parent.mkdir(parents=True, exist_ok=True)
         tmp_file = f"{STATUS_FILE}.tmp"
@@ -68,6 +104,11 @@ def append_to_history(status, run_id, file_name=None, error=None, duration=None,
         except:
             pass
             
+    try:
+        log_diagnostics(HISTORY_FILE)
+    except Exception as diag_err:
+        print(f"Diagnostics error: {str(diag_err)}")
+        
     try:
         from pathlib import Path
         Path(HISTORY_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +184,11 @@ def run_unified_pipeline():
             import logging
             logger = logging.getLogger("UnifiedMedallionPipeline")
             
+            try:
+                log_diagnostics(METRICS_FILE)
+            except Exception as diag_err:
+                logger.warning(f"Diagnostics logging failed: {str(diag_err)}")
+                
             Path(METRICS_FILE).parent.mkdir(parents=True, exist_ok=True)
             tmp_file = f"{METRICS_FILE}.tmp"
             with open(tmp_file, "w") as f:
@@ -151,7 +197,12 @@ def run_unified_pipeline():
         except Exception as e:
             import logging
             logger = logging.getLogger("UnifiedMedallionPipeline")
-            logger.error(f"Failed to persist metrics: {str(e)}")
+            logger.warning(f"Failed to persist metrics: {str(e)}")
+            try:
+                # Log incident as warning
+                log_incident("unified_pipeline", run_id, "metrics_persistence", f"Failed to persist metrics: {str(e)}", "WARNING")
+            except Exception as inc_err:
+                logger.warning(f"Failed to log incident: {str(inc_err)}")
             
         rows_processed = 0
         try:

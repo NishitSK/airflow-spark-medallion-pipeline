@@ -17,6 +17,26 @@ except ImportError:
 def log_operation(event_type, message):
     log_dir = os.path.join(BASE_DATA_PATH, "output")
     log_file = os.path.join(log_dir, "operations.log")
+    
+    # Diagnostics check before writing
+    try:
+        from pathlib import Path
+        uid = None
+        gid = None
+        try:
+            uid = os.getuid()
+            gid = os.getgid()
+        except AttributeError:
+            pass
+        path = Path(log_file)
+        parent_dir = path.parent
+        path_exists = path.exists()
+        target_to_check = str(path) if path_exists else str(parent_dir)
+        is_writable = os.access(target_to_check, os.W_OK)
+        print(f"[DIAGNOSTICS] Writing to: {log_file} | Parent exists: {parent_dir.exists()} | File exists: {path_exists} | UID: {uid} | GID: {gid} | Writable: {is_writable}")
+    except Exception as diag_err:
+        print(f"Diagnostics logging failed: {str(diag_err)}")
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_line = f"[{timestamp}] [{event_type.upper()}] {message}\n"
     try:
