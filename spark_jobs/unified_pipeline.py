@@ -41,9 +41,12 @@ def write_status(status, run_id, file_name=None, error=None, duration=None, stag
         "duration": f"{duration:.2f}" if duration is not None else None
     }
     try:
-        os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
-        with open(STATUS_FILE, "w") as f:
+        from pathlib import Path
+        Path(STATUS_FILE).parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = f"{STATUS_FILE}.tmp"
+        with open(tmp_file, "w") as f:
             json.dump(status_data, f, indent=4)
+        os.replace(tmp_file, STATUS_FILE)
     except Exception as e:
         print(f"Error writing status file: {str(e)}")
 
@@ -66,7 +69,8 @@ def append_to_history(status, run_id, file_name=None, error=None, duration=None,
             pass
             
     try:
-        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+        from pathlib import Path
+        Path(HISTORY_FILE).parent.mkdir(parents=True, exist_ok=True)
         record = {
             "timestamp": time.time(),
             "run_id": run_id,
@@ -76,8 +80,17 @@ def append_to_history(status, run_id, file_name=None, error=None, duration=None,
             "rows": rows,
             "error": error
         }
-        with open(HISTORY_FILE, "a") as f:
-            f.write(json.dumps(record) + "\n")
+        tmp_file = f"{HISTORY_FILE}.tmp"
+        existing_content = ""
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, "r") as f:
+                    existing_content = f.read()
+            except:
+                pass
+        with open(tmp_file, "w") as f:
+            f.write(existing_content + json.dumps(record) + "\n")
+        os.replace(tmp_file, HISTORY_FILE)
     except Exception as e:
         print(f"Error writing history file: {str(e)}")
 
@@ -121,9 +134,20 @@ def run_unified_pipeline():
         print(f"\n--- Unified Pipeline Success: {duration:.2f}s ---")
         
         # Save metrics for dashboard
-        os.makedirs(os.path.dirname(METRICS_FILE), exist_ok=True)
-        with open(METRICS_FILE, "w") as f:
-            f.write(f"{time.time()},{duration:.2f}\n")
+        try:
+            from pathlib import Path
+            import logging
+            logger = logging.getLogger("UnifiedMedallionPipeline")
+            
+            Path(METRICS_FILE).parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = f"{METRICS_FILE}.tmp"
+            with open(tmp_file, "w") as f:
+                f.write(f"{time.time()},{duration:.2f}\n")
+            os.replace(tmp_file, METRICS_FILE)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger("UnifiedMedallionPipeline")
+            logger.error(f"Failed to persist metrics: {str(e)}")
             
         rows_processed = 0
         try:

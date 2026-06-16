@@ -16,13 +16,23 @@ except ImportError:
 
 def log_operation(event_type, message):
     log_dir = os.path.join(BASE_DATA_PATH, "output")
-    os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "operations.log")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_line = f"[{timestamp}] [{event_type.upper()}] {message}\n"
     try:
-        with open(log_file, "a") as f:
-            f.write(log_line)
+        from pathlib import Path
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = f"{log_file}.tmp"
+        existing_content = ""
+        if os.path.exists(log_file):
+            try:
+                with open(log_file, "r") as f:
+                    existing_content = f.read()
+            except:
+                pass
+        with open(tmp_file, "w") as f:
+            f.write(existing_content + log_line)
+        os.replace(tmp_file, log_file)
     except Exception as e:
         print(f"Failed to write operations log: {str(e)}")
 
