@@ -391,8 +391,10 @@ if page == "Pipeline Dashboard":
                 st.write("**Est. Ingestion Time:** `~2 seconds`")
                 st.write("**Processing Cost:** `$0.001 USD`")
                 st.divider()
-                st.button("Load Small CSV", type="secondary", use_container_width=True, on_click=run_sample, args=("Small CSV", "small_sample.csv"))
-                st.button("Load Small JSON", type="secondary", use_container_width=True, on_click=run_sample, args=("Small JSON", "small_sample.json"))
+                if st.button("Load Small CSV", type="secondary", use_container_width=True):
+                    run_sample("Small CSV", "small_sample.csv")
+                if st.button("Load Small JSON", type="secondary", use_container_width=True):
+                    run_sample("Small JSON", "small_sample.json")
                 
         with col_s2:
             with st.container(border=True):
@@ -401,8 +403,10 @@ if page == "Pipeline Dashboard":
                 st.write("**Est. Ingestion Time:** `~5 seconds`")
                 st.write("**Processing Cost:** `$0.10 USD`")
                 st.divider()
-                st.button("Load Medium CSV", type="secondary", use_container_width=True, on_click=run_sample, args=("Medium CSV", "medium_sample.csv"))
-                st.button("Load Medium JSON", type="secondary", use_container_width=True, on_click=run_sample, args=("Medium JSON", "medium_sample.json"))
+                if st.button("Load Medium CSV", type="secondary", use_container_width=True):
+                    run_sample("Medium CSV", "medium_sample.csv")
+                if st.button("Load Medium JSON", type="secondary", use_container_width=True):
+                    run_sample("Medium JSON", "medium_sample.json")
                 
         with col_s3:
             with st.container(border=True):
@@ -411,7 +415,8 @@ if page == "Pipeline Dashboard":
                 st.write("**Est. Ingestion Time:** `~15 seconds`")
                 st.write("**Processing Cost:** `$1.00 USD`")
                 st.divider()
-                st.button("Load Large CSV", type="secondary", use_container_width=True, on_click=run_sample, args=("Large CSV", "large_sample.csv"))
+                if st.button("Load Large CSV", type="secondary", use_container_width=True):
+                    run_sample("Large CSV", "large_sample.csv")
 
     # ----------------- PIPELINE EXECUTION PANEL -----------------
     st.divider()
