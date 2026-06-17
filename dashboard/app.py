@@ -1269,7 +1269,10 @@ elif page == "Delta Lake Transaction Log":
             st.subheader("Processing Volume History")
             df_files = pd.DataFrame(file_data)
             df_files = df_files[df_files["Rows Written"] > 0]
-      elif page == "Data Quality & Observability":
+    except Exception as e:
+        st.error(f"Failed to load Delta Lake transaction log: {e}")
+
+elif page == "Data Quality & Observability":
     from queries import col, read_delta_pandas, get_latest_dataset_type, get_latest_successful_run_id, get_dq_run_report
     
     st.title("🛡️ Data Quality & Observability Portal")
