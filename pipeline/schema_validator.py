@@ -83,7 +83,10 @@ def validate_schema(df: DataFrame, source_file: str = "unknown") -> dict:
         
     # 3. Fail if missing columns
     if missing_cols:
-        expected_str = ",".join(required_cols)
-        raise SchemaValidationError(f"Unsupported dataset schema. Expected columns: {expected_str}")
+        if len(missing_cols) == 1:
+            msg = f"Unsupported dataset schema. Missing required column: {missing_cols[0]}"
+        else:
+            msg = f"Unsupported dataset schema. Missing required columns: {', '.join(missing_cols)}"
+        raise SchemaValidationError(msg)
         
     return report

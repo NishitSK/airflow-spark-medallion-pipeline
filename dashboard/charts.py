@@ -1,6 +1,7 @@
 import plotly.express as px
-
 def plot_age_distribution(df):
+    if df is None or df.empty or "age" not in df.columns:
+        return None
     fig = px.histogram(df, x="age", nbins=20, title="Age Distribution")
     fig.update_layout(
         template="plotly_dark",
@@ -11,6 +12,8 @@ def plot_age_distribution(df):
     return fig
 
 def plot_gold_trends(df):
+    if df is None or df.empty or "average_age" not in df.columns:
+        return None
     fig = px.line(df, x="processed_date", y="average_age", 
                    title="Average Age Trend", markers=True)
     fig.update_layout(

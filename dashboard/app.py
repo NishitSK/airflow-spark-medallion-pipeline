@@ -218,6 +218,9 @@ def get_user_friendly_error(err):
     if "permission denied" in err_lower or "permissionerror" in err_lower:
         explanation = "A storage path or file write operation failed due to directory permission restrictions."
         suggestion = "Verify write permissions on the data directories under `/data/` and ensure the container user (UID 50000) has write access to the mounted volumes."
+    elif "unsupported dataset schema" in err_lower or "schema_validation" in err_lower or "missing required column" in err_lower:
+        explanation = "Unsupported dataset schema."
+        suggestion = "The uploaded file does not match the expected schema. Please ensure all required columns are present and mapped correctly."
     elif "not found" in err_lower or "does not exist" in err_lower or "no such file" in err_lower or "missing" in err_lower:
         explanation = "A required storage path or Delta table directory is unavailable."
         suggestion = "Verify that your local storage directories under data/ are mounted and writable. Ensure a dataset has been ingested first."
@@ -947,19 +950,24 @@ if page == "Pipeline Dashboard":
                         mime="text/csv",
                         type="primary"
                     )
-                with col_slider:
-                    age_range = st.slider("Interactive Filter: Select Age Scope", 0, 120, (18, 65), key="silver_age_slider")
+                if 'age' in full_pdf.columns:
+                    with col_slider:
+                        age_range = st.slider("Interactive Filter: Select Age Scope", 0, 120, (18, 65), key="silver_age_slider")
+                    
+                    filtered_pdf = full_pdf[(full_pdf['age'] >= age_range[0]) & (full_pdf['age'] <= age_range[1])]
+                    
+                    # Statistics Metrics
+                    m_avg, m_min, m_max = st.columns(3)
+                    m_avg.metric("Average User Age", f"{filtered_pdf['age'].mean():.1f} yrs" if len(filtered_pdf) > 0 and pd.notnull(filtered_pdf['age'].mean()) else "N/A")
+                    m_min.metric("Minimum User Age", f"{int(filtered_pdf['age'].min())} yrs" if len(filtered_pdf) > 0 and pd.notnull(filtered_pdf['age'].min()) else "N/A")
+                    m_max.metric("Maximum User Age", f"{int(filtered_pdf['age'].max())} yrs" if len(filtered_pdf) > 0 and pd.notnull(filtered_pdf['age'].max()) else "N/A")
+                    
+                    display_pdf = filtered_pdf.head(1000)
+                    st.plotly_chart(plot_age_distribution(display_pdf), use_container_width=True)
+                else:
+                    filtered_pdf = full_pdf
+                    display_pdf = filtered_pdf.head(1000)
                 
-                filtered_pdf = full_pdf[(full_pdf['age'] >= age_range[0]) & (full_pdf['age'] <= age_range[1])]
-                
-                # Statistics Metrics
-                m_avg, m_min, m_max = st.columns(3)
-                m_avg.metric("Average User Age", f"{filtered_pdf['age'].mean():.1f} yrs" if len(filtered_pdf) > 0 else "N/A")
-                m_min.metric("Minimum User Age", f"{int(filtered_pdf['age'].min())} yrs" if len(filtered_pdf) > 0 else "N/A")
-                m_max.metric("Maximum User Age", f"{int(filtered_pdf['age'].max())} yrs" if len(filtered_pdf) > 0 else "N/A")
-                
-                display_pdf = filtered_pdf.head(1000)
-                st.plotly_chart(plot_age_distribution(display_pdf), use_container_width=True)
                 st.dataframe(display_pdf.head(100), use_container_width=True)
         else:
             st.info("Silver layer data is currently empty.")
@@ -971,11 +979,19 @@ if page == "Pipeline Dashboard":
             with st.container(border=True):
                 # Summary Statistics for Gold
                 g1, g2, g3 = st.columns(3)
-                g1.metric("Average Gold Age", f"{pdf['average_age'].mean():.1f} yrs" if not pdf.empty else "N/A")
-                g2.metric("Total Managed Users", f"{pdf['total_users'].sum():,}" if not pdf.empty else "N/A")
+                if 'average_age' in pdf.columns:
+                    g1.metric("Average Gold Age", f"{pdf['average_age'].mean():.1f} yrs" if not pdf.empty and pd.notnull(pdf['average_age'].mean()) else "N/A")
+                else:
+                    g1.metric("Average Gold Age", "N/A")
+                
+                if 'total_users' in pdf.columns:
+                    g2.metric("Total Managed Users", f"{pdf['total_users'].sum():,}" if not pdf.empty else "N/A")
+                else:
+                    g2.metric("Total Managed Users", "N/A")
                 g3.metric("Aggregated Dates", f"{len(pdf)}" if not pdf.empty else "N/A")
                 
-                st.plotly_chart(plot_gold_trends(pdf), use_container_width=True)
+                if 'average_age' in pdf.columns:
+                    st.plotly_chart(plot_gold_trends(pdf), use_container_width=True)
                 st.dataframe(pdf, use_container_width=True)
         else:
             st.info("Gold layer metrics are currently empty.")

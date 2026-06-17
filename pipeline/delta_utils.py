@@ -6,7 +6,7 @@ def get_spark_session(app_name="MedallionPipeline", shuffle_partitions=1):
     """
     Standardized SparkSession builder with Delta support and Java 17+ fixes.
     """
-    os.environ["PYSPARK_SUBMIT_ARGS"] = "pyspark-shell"
+    os.environ["PYSPARK_SUBMIT_ARGS"] = f"--packages {DELTA_PACKAGE} pyspark-shell"
     
     return SparkSession.builder \
         .appName(app_name) \

@@ -52,6 +52,19 @@ def read_delta_pandas(path, columns=None):
         files = [f for f in files if "_delta_log" not in f]
         if not files:
             return pd.DataFrame()
+            
+        # Dynamically verify columns to prevent pyarrow/pandas ValueError if any are missing
+        if columns is not None:
+            try:
+                import pyarrow.parquet as pq
+                schema = pq.read_schema(files[0])
+                actual_cols = schema.names
+                columns = [c for c in columns if c in actual_cols]
+                if not columns:
+                    return pd.DataFrame()
+            except Exception as schema_e:
+                print(f"Error reading parquet schema for validation: {schema_e}")
+                
         # Read from path directory using Pandas read_parquet
         return pd.read_parquet(path, columns=columns)
     except Exception as e:
@@ -493,13 +506,15 @@ def get_dq_audit_details(spark=None):
                 return None
 
         # Detect malformed IDs
-        id_series = df["id"]
-        malformed_ids_mask = id_series.notnull() & (id_series.astype(str).str.strip() != "") & (id_series.apply(to_int_safe).isnull())
-        malformed_ids_df = df[malformed_ids_mask]
-        audit_data["malformed_ids"]["count"] = len(malformed_ids_df)
-        if len(malformed_ids_df) > 0:
-            samples = malformed_ids_df[["id", "name"]].head(5)
-            audit_data["malformed_ids"]["samples"] = samples.to_dict(orient="records")
+        if "id" in df.columns:
+            id_series = df["id"]
+            malformed_ids_mask = id_series.notnull() & (id_series.astype(str).str.strip() != "") & (id_series.apply(to_int_safe).isnull())
+            malformed_ids_df = df[malformed_ids_mask]
+            audit_data["malformed_ids"]["count"] = len(malformed_ids_df)
+            if len(malformed_ids_df) > 0:
+                cols_to_use = [c for c in ["id", "name"] if c in df.columns]
+                samples = malformed_ids_df[cols_to_use].head(5)
+                audit_data["malformed_ids"]["samples"] = samples.to_dict(orient="records")
             
         # 2. Malformed / Out-of-bounds Ages
         def is_malformed_age_val(val):
@@ -514,33 +529,36 @@ def get_dq_audit_details(spark=None):
             except:
                 return True
 
-        age_series = df["age"]
-        malformed_ages_mask = age_series.notnull() & (age_series.astype(str).str.strip() != "") & (age_series.apply(is_malformed_age_val))
-        malformed_ages_df = df[malformed_ages_mask]
-        audit_data["malformed_ages"]["count"] = len(malformed_ages_df)
-        if len(malformed_ages_df) > 0:
-            samples = malformed_ages_df[["age", "name"]].head(5)
-            audit_data["malformed_ages"]["samples"] = samples.to_dict(orient="records")
+        if "age" in df.columns:
+            age_series = df["age"]
+            malformed_ages_mask = age_series.notnull() & (age_series.astype(str).str.strip() != "") & (age_series.apply(is_malformed_age_val))
+            malformed_ages_df = df[malformed_ages_mask]
+            audit_data["malformed_ages"]["count"] = len(malformed_ages_df)
+            if len(malformed_ages_df) > 0:
+                cols_to_use = [c for c in ["age", "name"] if c in df.columns]
+                samples = malformed_ages_df[cols_to_use].head(5)
+                audit_data["malformed_ages"]["samples"] = samples.to_dict(orient="records")
             
         # 3. Duplicate IDs (on normalized ID)
-        df["normalized_id"] = id_series.apply(lambda x: str(to_int_safe(x)) if to_int_safe(x) is not None else "")
-        valid_id_df = df[df["normalized_id"] != ""]
-        
-        dup_counts = valid_id_df["normalized_id"].value_counts()
-        dup_ids = dup_counts[dup_counts > 1].index.tolist()
-        
-        audit_data["duplicate_ids"]["count"] = len(dup_ids)
-        if len(dup_ids) > 0:
-            sample_df = valid_id_df[valid_id_df["normalized_id"].isin(dup_ids[:5])]
-            # Map columns
-            samples = []
-            for _, r in sample_df.iterrows():
-                samples.append({
-                    "raw_id": r["id"],
-                    "name": r["name"],
-                    "occurrences": dup_counts[r["normalized_id"]]
-                })
-            audit_data["duplicate_ids"]["samples"] = samples[:5]
+        if "id" in df.columns:
+            df["normalized_id"] = id_series.apply(lambda x: str(to_int_safe(x)) if to_int_safe(x) is not None else "")
+            valid_id_df = df[df["normalized_id"] != ""]
+            
+            dup_counts = valid_id_df["normalized_id"].value_counts()
+            dup_ids = dup_counts[dup_counts > 1].index.tolist()
+            
+            audit_data["duplicate_ids"]["count"] = len(dup_ids)
+            if len(dup_ids) > 0:
+                sample_df = valid_id_df[valid_id_df["normalized_id"].isin(dup_ids[:5])]
+                # Map columns
+                samples = []
+                for _, r in sample_df.iterrows():
+                    samples.append({
+                        "raw_id": r["id"],
+                        "name": r.get("name", "N/A"),
+                        "occurrences": dup_counts[r["normalized_id"]]
+                    })
+                audit_data["duplicate_ids"]["samples"] = samples[:5]
             
     except Exception as e:
         print(f"Error fetching DQ audit details: {str(e)}")

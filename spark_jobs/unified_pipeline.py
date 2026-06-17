@@ -524,8 +524,8 @@ def run_unified_pipeline():
         print(f"  Run ID     : {run_id}")
         print(f"  Duration   : {duration:.1f}s")
         print(f"  DQ Score   : {scorecard.get('dq_score', 'N/A')}%")
-        print(f"  Accepted   : {scorecard.get('valid_rows', 0):,} rows → Silver")
-        print(f"  Quarantined: {quarantine_count:,} rows → Quarantine")
+        print(f"  Accepted   : {scorecard.get('valid_rows', 0):,} rows -> Silver")
+        print(f"  Quarantined: {quarantine_count:,} rows -> Quarantine")
         if anomalies:
             print(f"  Anomalies  : {len(anomalies)} detected")
         print(f"{'='*60}\n")
