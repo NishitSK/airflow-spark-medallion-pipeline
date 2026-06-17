@@ -15,11 +15,13 @@ def clean_input_and_output():
     if os.path.exists(INPUT_DIR):
         for f in os.listdir(INPUT_DIR):
             if f.endswith(('.csv', '.json')):
-                os.remove(os.path.join(INPUT_DIR, f))
+                try:
+                    os.remove(os.path.join(INPUT_DIR, f))
+                except Exception:
+                    pass
     else:
         os.makedirs(INPUT_DIR, exist_ok=True)
         
-    # Remove status file if exists
     if os.path.exists(STATUS_FILE):
         try:
             os.remove(STATUS_FILE)
@@ -35,7 +37,6 @@ def run_pipeline():
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     dur = time.time() - t0
     
-    # Read status from pipeline_status.json
     status_data = {}
     if os.path.exists(STATUS_FILE):
         try:
@@ -46,23 +47,16 @@ def run_pipeline():
             
     return result.returncode, result.stdout, result.stderr, status_data, dur
 
-def write_csv(filename, headers, rows):
-    filepath = os.path.join(INPUT_DIR, filename)
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        writer.writerows(rows)
-    return filepath
-
-def run_test_case(name, headers, rows_generator, expected_pass, expected_err_substring=None):
+def run_test_case(name, headers, rows_generator, expected_pass, expected_dataset_type=None, expected_err_substring=None):
     print(f"\n==================================================")
     print(f" RUNNING {name}")
     print(f"==================================================")
     
     clean_input_and_output()
     
-    # Generate CSV
-    filepath = os.path.join(INPUT_DIR, f"{name.lower().replace(' ', '_')}.csv")
+    # Generate CSV with a clean file name
+    sanitized_name = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(",", "_")
+    filepath = os.path.join(INPUT_DIR, f"{sanitized_name}.csv")
     t_gen_0 = time.time()
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -70,15 +64,16 @@ def run_test_case(name, headers, rows_generator, expected_pass, expected_err_sub
         rows_generator(writer)
     print(f"Generated test dataset in {time.time() - t_gen_0:.2f} seconds")
     
-    # Run
+    # Run the pipeline script
     code, stdout, stderr, status, dur = run_pipeline()
     
     print(f"Exit Code: {code}")
     print(f"Duration: {dur:.2f} seconds")
     print(f"Status in JSON: {status.get('status', 'N/A')}")
+    print(f"Dataset Type in JSON: {status.get('dataset_type', 'N/A')}")
     print(f"Error in JSON: {status.get('error', 'None')}")
     
-    # Verify
+    # Verify results
     success = True
     if expected_pass:
         if code != 0 or status.get("status") != "completed":
@@ -90,7 +85,7 @@ def run_test_case(name, headers, rows_generator, expected_pass, expected_err_sub
             print(f"[PASS] Pipeline processed successfully as expected.")
     else:
         if code == 0 or status.get("status") == "completed":
-            print(f"[FAIL] Expected FAIL CLEANLY, but pipeline succeeded with exit code {code}")
+            print(f"[FAIL] Expected FAIL, but pipeline succeeded.")
             success = False
         else:
             err_msg = status.get("error", "") or stderr or stdout
@@ -99,99 +94,158 @@ def run_test_case(name, headers, rows_generator, expected_pass, expected_err_sub
                 print("Pipeline Stderr:\n", stderr)
                 success = False
             else:
-                print(f"[PASS] Pipeline failed cleanly as expected. Error matches: '{err_msg.strip()}'")
+                print(f"[PASS] Pipeline failed as expected. Error matches: '{err_msg.strip()}'")
                 
-    return success
+    if expected_dataset_type:
+        actual_type = status.get("dataset_type", "N/A")
+        if actual_type != expected_dataset_type:
+            print(f"[FAIL] Expected Dataset Type '{expected_dataset_type}', but got '{actual_type}'")
+            success = False
+        else:
+            print(f"[PASS] Dataset Type matches expected: '{actual_type}'")
+                
+    return success, dur
 
 def main():
-    test_cases = [
-        # TEST 1
-        (
-            "TEST 1 (id,name,age)",
-            ["id", "name", "age"],
-            lambda w: w.writerow(["1001", "John Smith", "35"]),
-            True,
-            None
-        ),
-        # TEST 2
-        (
-            "TEST 2 (age,id,name)",
-            ["age", "id", "name"],
-            lambda w: w.writerow(["35", "1001", "John Smith"]),
-            True,
-            None
-        ),
-        # TEST 3
-        (
-            "TEST 3 (name,age,id,email,phone)",
-            ["name", "age", "id", "email", "phone"],
-            lambda w: w.writerow(["John Smith", "35", "1001", "john@example.com", "555-0199"]),
-            True,
-            None
-        ),
-        # TEST 4
-        (
-            "TEST 4 (id,name)",
-            ["id", "name"],
-            lambda w: w.writerow(["1001", "John Smith"]),
-            False,
-            "Missing required column: age"
-        ),
-        # TEST 5
-        (
-            "TEST 5 (order_id,customer_id,product_name,price)",
-            ["order_id", "customer_id", "product_name", "price"],
-            lambda w: w.writerow(["9001", "2001", "Widget", "19.99"]),
-            False,
-            "Unsupported dataset schema"
-        ),
-        # TEST 6
-        (
-            "TEST 6 (id,name,age,gender,date,month,year)",
-            ["id", "name", "age", "gender", "date", "month", "year"],
-            lambda w: w.writerow(["1001", "John Smith", "35", "Male", "17", "06", "2026"]),
-            True,
-            None
-        ),
-    ]
-    
-    # Run tests 1 to 6
+    results = []
     overall_success = True
-    for tc in test_cases:
-        overall_success &= run_test_case(tc[0], tc[1], tc[2], tc[3], tc[4])
-        
-    # TEST 7: 1 million row dataset with supported schema
-    def test_7_rows(writer):
-        for i in range(1, 1000001):
-            writer.writerow([str(i), f"User_{i}", "30"])
-    overall_success &= run_test_case(
-        "TEST 7 (1M Rows Supported)",
-        ["id", "name", "age"],
-        test_7_rows,
-        True,
-        None
-    )
     
-    # TEST 8: 1 million row dataset with unsupported schema
+    # TEST 1: id,name,age -> CUSTOMER
+    success, dur = run_test_case(
+        "TEST 1 (id,name,age)",
+        ["id", "name", "age"],
+        lambda w: w.writerow(["1001", "John Smith", "35"]),
+        expected_pass=True,
+        expected_dataset_type="CUSTOMER"
+    )
+    results.append(("TEST 1", success, dur))
+    overall_success &= success
+    
+    # TEST 2: age,id,name -> CUSTOMER
+    success, dur = run_test_case(
+        "TEST 2 (age,id,name)",
+        ["age", "id", "name"],
+        lambda w: w.writerow(["35", "1001", "John Smith"]),
+        expected_pass=True,
+        expected_dataset_type="CUSTOMER"
+    )
+    results.append(("TEST 2", success, dur))
+    overall_success &= success
+    
+    # TEST 3: id,name,age,email,phone -> CUSTOMER
+    success, dur = run_test_case(
+        "TEST 3 (id,name,age,email,phone)",
+        ["id", "name", "age", "email", "phone"],
+        lambda w: w.writerow(["1001", "John Smith", "35", "john@example.com", "555-0101"]),
+        expected_pass=True,
+        expected_dataset_type="CUSTOMER"
+    )
+    results.append(("TEST 3", success, dur))
+    overall_success &= success
+    
+    # TEST 4: order_id,product_name,quantity,unit_price -> ORDERS
+    success, dur = run_test_case(
+        "TEST 4 (order_id,product_name,quantity,unit_price)",
+        ["order_id", "product_name", "quantity", "unit_price"],
+        lambda w: w.writerow(["9001", "Widget A", "5", "19.99"]),
+        expected_pass=True,
+        expected_dataset_type="ORDERS"
+    )
+    results.append(("TEST 4", success, dur))
+    overall_success &= success
+    
+    # TEST 5: order_id,product_name,quantity,unit_price,order_date -> ORDERS
+    success, dur = run_test_case(
+        "TEST 5 (order_id,product_name,quantity,unit_price,order_date)",
+        ["order_id", "product_name", "quantity", "unit_price", "order_date"],
+        lambda w: w.writerow(["9001", "Widget A", "5", "19.99", "2026-06-17"]),
+        expected_pass=True,
+        expected_dataset_type="ORDERS"
+    )
+    results.append(("TEST 5", success, dur))
+    overall_success &= success
+    
+    # TEST 6: employee_id,department,salary -> GENERIC
+    success, dur = run_test_case(
+        "TEST 6 (employee_id,department,salary)",
+        ["employee_id", "department", "salary"],
+        lambda w: w.writerow(["E101", "Sales", "65000.00"]),
+        expected_pass=True,
+        expected_dataset_type="GENERIC"
+    )
+    results.append(("TEST 6", success, dur))
+    overall_success &= success
+    
+    # TEST 7: random columns -> GENERIC
+    success, dur = run_test_case(
+        "TEST 7 (col_a,col_b,col_c)",
+        ["col_a", "col_b", "col_c"],
+        lambda w: w.writerow(["ValA", "ValB", "ValC"]),
+        expected_pass=True,
+        expected_dataset_type="GENERIC"
+    )
+    results.append(("TEST 7", success, dur))
+    overall_success &= success
+    
+    # TEST 8: 1 million rows customer schema -> CUSTOMER
     def test_8_rows(writer):
         for i in range(1, 1000001):
-            writer.writerow([str(i), f"Cust_{i}", f"Product_{i}", "19.99"])
-    overall_success &= run_test_case(
-        "TEST 8 (1M Rows Unsupported)",
-        ["order_id", "customer_id", "product_name", "price"],
+            writer.writerow([str(i), f"User_{i}", "30"])
+    success, dur = run_test_case(
+        "TEST 8 (1M Rows Customer Schema)",
+        ["id", "name", "age"],
         test_8_rows,
-        False,
-        "Unsupported dataset schema"
+        expected_pass=True,
+        expected_dataset_type="CUSTOMER"
     )
+    results.append(("TEST 8", success, dur))
+    overall_success &= success
     
-    print("\n" + "="*50)
+    # TEST 9: 1 million rows orders schema -> ORDERS
+    def test_9_rows(writer):
+        for i in range(1, 1000001):
+            writer.writerow([f"O_{i}", f"Product_{i}", "2", "9.99"])
+    success, dur = run_test_case(
+        "TEST 9 (1M Rows Orders Schema)",
+        ["order_id", "product_name", "quantity", "unit_price"],
+        test_9_rows,
+        expected_pass=True,
+        expected_dataset_type="ORDERS"
+    )
+    results.append(("TEST 9", success, dur))
+    overall_success &= success
+    
+    # TEST 10: 1 million rows unknown schema -> GENERIC
+    def test_10_rows(writer):
+        for i in range(1, 1000001):
+            writer.writerow([f"E_{i}", "Engineering", "95000"])
+    success, dur = run_test_case(
+        "TEST 10 (1M Rows Unknown Schema)",
+        ["employee_id", "department", "salary"],
+        test_10_rows,
+        expected_pass=True,
+        expected_dataset_type="GENERIC"
+    )
+    results.append(("TEST 10", success, dur))
+    overall_success &= success
+    
+    # Print summary table
+    print("\n" + "="*60)
+    print("                TEST MATRIX RESULT SUMMARY")
+    print("="*60)
+    print(f"{'Test Case':<10} | {'Status':<10} | {'Duration (s)':<15}")
+    print("-"*60)
+    for name, success, dur in results:
+        status_str = "SUCCESS" if success else "FAILED"
+        print(f"{name:<10} | {status_str:<10} | {dur:.2f}")
+    print("="*60)
+    
     if overall_success:
-        print("[SUCCESS] ALL TESTS PASSED SUCCESSFULLY!")
+        print("[SUCCESS] ALL 10 TESTS PASSED SUCCESSFULLY!")
     else:
         print("[FAIL] SOME TEST CASES FAILED!")
-    print("="*50)
+    print("="*60)
     
-    # Return code for bash pipeline integration
     sys.exit(0 if overall_success else 1)
 
 if __name__ == "__main__":

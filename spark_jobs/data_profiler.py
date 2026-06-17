@@ -17,14 +17,82 @@ from pipeline.delta_utils import write_delta
 
 def profile_dataframe(df: DataFrame, run_id: str, source_file: str, spark: SparkSession, mappings: list = None):
     """
-    Compute statistical profile for each column using vectorized Pandas operations.
-    Returns a list of profile records and detected anomalies.
+    Compute statistical profile for each column using vectorized Pandas operations (small datasets)
+    or lazy, distributed Spark aggregations (large datasets).
     """
     import time
     start_time = time.time()
     profile_records = []
     anomalies = []
     
+    # Check if dataset is large based on raw file sizes in INPUT_PATH
+    large_dataset = False
+    try:
+        from pipeline.config import INPUT_PATH
+        if os.path.exists(INPUT_PATH):
+            file_sizes = [os.path.getsize(os.path.join(INPUT_PATH, f)) for f in os.listdir(INPUT_PATH) if f.endswith(('.csv', '.json'))]
+            total_bytes = sum(file_sizes)
+            if total_bytes > 5 * 1024 * 1024:  # > 5 MB
+                large_dataset = True
+    except Exception as e:
+        print(f"[Profiler] Warning estimating file sizes: {e}")
+
+    if large_dataset:
+        print(f"[Profiler] Large dataset detected. Performing lazy, distributed PySpark profiling...")
+        columns_to_profile = [c for c in df.columns if c not in ("ingestion_time", "source_file")]
+        
+        # Single pass distributed aggregation
+        agg_exprs = [F.count("*").alias("total_rows")]
+        for c in columns_to_profile:
+            is_null_expr = F.when(col(c).isNull() | (F.trim(col(c)) == "") | (col(c) == "None") | (col(c) == "nan") | (col(c) == "NaN"), 1).otherwise(0)
+            agg_exprs.append(F.sum(is_null_expr).alias(f"{c}_nulls"))
+            agg_exprs.append(F.countDistinct(c).alias(f"{c}_distinct"))
+            agg_exprs.append(F.min(col(c)).alias(f"{c}_min"))
+            agg_exprs.append(F.max(col(c)).alias(f"{c}_max"))
+            agg_exprs.append(F.mean(col(c).cast("double")).alias(f"{c}_mean"))
+            agg_exprs.append(F.stddev(col(c).cast("double")).alias(f"{c}_stddev"))
+
+        metrics_row = df.select(*agg_exprs).collect()[0]
+        total_rows = int(metrics_row["total_rows"] or 0)
+        
+        if total_rows == 0:
+            return [], [], 0
+
+        for c in columns_to_profile:
+            nulls = int(metrics_row[f"{c}_nulls"] or 0)
+            distinct = int(metrics_row[f"{c}_distinct"] or 0)
+            min_val = metrics_row[f"{c}_min"]
+            max_val = metrics_row[f"{c}_max"]
+            mean_val = metrics_row[f"{c}_mean"]
+            stddev_val = metrics_row[f"{c}_stddev"]
+            
+            null_pct = round(nulls / total_rows * 100, 2) if total_rows > 0 else 0.0
+            dup_count = total_rows - distinct
+            dup_pct = round(dup_count / total_rows * 100, 2) if total_rows > 0 else 0.0
+            
+            profile_records.append({
+                "run_id":          run_id,
+                "source_file":     source_file,
+                "column_name":     c,
+                "total_rows":      float(total_rows),
+                "null_count":      float(nulls),
+                "null_pct":        float(null_pct),
+                "distinct_count":  float(distinct),
+                "duplicate_count": float(dup_count),
+                "duplicate_pct":   float(dup_pct),
+                "min_value":       str(min_val) if min_val is not None else None,
+                "max_value":       str(max_val) if max_val is not None else None,
+                "mean_value":      str(round(mean_val, 2)) if mean_val is not None else None,
+                "stddev_value":    str(round(stddev_val, 2)) if stddev_val is not None else None,
+                "outlier_count":   0.0,
+                "top_values":      "N/A",
+            })
+            
+        anomalies += _detect_volume_anomalies(spark, total_rows, run_id)
+        total_dur = time.time() - start_time
+        print(f"[Profiler Timing] Lazy Spark profiling took: {total_dur:.2f} seconds")
+        return profile_records, anomalies, total_rows
+
     # 1. Try to read directly from input path using Pandas to avoid JVM serialization overhead
     pdf = None
     topandas_dur = 0.0

@@ -26,7 +26,7 @@ def _load_config():
     return {}
 
 
-def validate_data(spark=None, run_id="unknown", source_file="unknown", bronze_df=None, bg_threads=None):
+def validate_data(spark=None, run_id="unknown", source_file="unknown", bronze_df=None, bg_threads=None, dataset_type="GENERIC"):
     """
     Runs enterprise row-level DQ on Bronze data.
     Returns: (valid_df, invalid_df, scorecard, should_fail)
@@ -47,8 +47,8 @@ def validate_data(spark=None, run_id="unknown", source_file="unknown", bronze_df
                 return None, None, {}, False
             df = read_delta(spark, BRONZE_PATH)
 
-        # Run enterprise DQ engine
-        valid_df, invalid_df, scorecard = run_dq_engine(df, run_id=run_id, source_file=source_file)
+        # Run enterprise DQ engine with dataset_type
+        valid_df, invalid_df, scorecard = run_dq_engine(df, run_id=run_id, source_file=source_file, dataset_type=dataset_type)
 
         # Persist DQ scorecard and metrics in background
         import threading
@@ -87,13 +87,14 @@ def validate_data(spark=None, run_id="unknown", source_file="unknown", bronze_df
 def _write_legacy_dq_metrics(scorecard: dict, spark: SparkSession):
     """Write to legacy dq_metrics Delta table for backward-compatible dashboard charts."""
     try:
-        metrics_data = [(
-            int(scorecard.get("total_rows", 0)),
-            int(scorecard.get("null_ids", 0)),
-            int(scorecard.get("invalid_ages", 0) + scorecard.get("null_ages", 0)),
-            int(scorecard.get("duplicate_ids", 0)),
-            int(scorecard.get("null_ages", 0)),
-        )]
+        # Default non-customer metrics to 0
+        total_rows = int(scorecard.get("total_rows", 0))
+        null_ids = int(scorecard.get("null_ids", 0))
+        invalid_ages = int(scorecard.get("invalid_ages", 0) + scorecard.get("null_ages", 0))
+        duplicate_ids = int(scorecard.get("duplicate_ids", 0))
+        null_ages = int(scorecard.get("null_ages", 0))
+        
+        metrics_data = [(total_rows, null_ids, invalid_ages, duplicate_ids, null_ages)]
         cols = ["total_rows", "null_ids", "invalid_ages", "duplicate_ids", "negative_ages"]
         metrics_df = spark.createDataFrame(metrics_data, cols) \
             .withColumn("validation_time", current_timestamp())

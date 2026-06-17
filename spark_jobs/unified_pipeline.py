@@ -60,7 +60,7 @@ def log_diagnostics(file_path):
     print(msg)
 
 
-def write_status(status, run_id, file_name=None, error=None, duration=None, stage=None):
+def write_status(status, run_id, file_name=None, error=None, duration=None, stage=None, dataset_type=None):
     if not file_name and os.path.exists(INPUT_PATH):
         try:
             files = [f for f in os.listdir(INPUT_PATH) if f.endswith(('.csv', '.json'))]
@@ -85,6 +85,7 @@ def write_status(status, run_id, file_name=None, error=None, duration=None, stag
         "stage":     stage or "Waiting",
         "error":     error,
         "duration":  f"{duration:.2f}" if duration is not None else None,
+        "dataset_type": dataset_type or "GENERIC"
     }
     try:
         log_diagnostics(STATUS_FILE)
@@ -101,7 +102,7 @@ def write_status(status, run_id, file_name=None, error=None, duration=None, stag
         print(f"Error writing status file: {e}")
 
 
-def append_to_history(status, run_id, file_name=None, error=None, duration=None, rows=0):
+def append_to_history(status, run_id, file_name=None, error=None, duration=None, rows=0, dataset_type=None):
     if not file_name and os.path.exists(INPUT_PATH):
         try:
             files = [f for f in os.listdir(INPUT_PATH) if f.endswith(('.csv', '.json'))]
@@ -132,6 +133,7 @@ def append_to_history(status, run_id, file_name=None, error=None, duration=None,
             "duration":  f"{duration:.2f}" if duration is not None else "N/A",
             "rows":      rows,
             "error":     error,
+            "dataset_type": dataset_type or "GENERIC"
         }
         tmp = f"{HISTORY_FILE}.tmp"
         existing = ""
@@ -313,19 +315,21 @@ def run_unified_pipeline():
         print(f"\n[Stage 1] Bronze Ingestion...")
 
         bronze_start_t = time.time()
-        bronze_df, source_file, mappings = ingest_bronze(spark=spark, run_id=run_id, bg_threads=bg_threads)
+        bronze_df, source_file, mappings, dataset_type = ingest_bronze(spark=spark, run_id=run_id, bg_threads=bg_threads)
         bronze_duration = time.time() - bronze_start_t
         
         if bronze_df is None:
-            write_status("failed", run_id, error="No input files found.", stage="Bronze")
-            append_to_history("failed", run_id, error="No input files found.")
+            write_status("failed", run_id, error="No input files found.", stage="Bronze", dataset_type="GENERIC")
+            append_to_history("failed", run_id, error="No input files found.", dataset_type="GENERIC")
             return
+
+        # Update status with detected type
+        write_status("running", run_id, stage="Profiling", dataset_type=dataset_type)
 
         # ============================================================
         # STAGE 2: Data Profiling
         # ============================================================
         print(f"\n[Stage 2] Data Profiling...")
-        write_status("running", run_id, stage="Profiling")
         profiling_duration = 0.0
         try:
             profiling_start_t = time.time()
@@ -354,11 +358,11 @@ def run_unified_pipeline():
         # STAGE 3: DQ Validation → valid_df + invalid_df
         # ============================================================
         print(f"\n[Stage 3] Enterprise DQ Validation...")
-        write_status("running", run_id, stage="Validation")
+        write_status("running", run_id, stage="Validation", dataset_type=dataset_type)
 
         validation_start_t = time.time()
         valid_df, invalid_df, scorecard, should_fail = validate_data(
-            spark=spark, run_id=run_id, source_file=source_file, bronze_df=bronze_df, bg_threads=bg_threads
+            spark=spark, run_id=run_id, source_file=source_file, bronze_df=bronze_df, bg_threads=bg_threads, dataset_type=dataset_type
         )
         validation_duration = time.time() - validation_start_t
 
@@ -370,7 +374,7 @@ def run_unified_pipeline():
         if invalid_df is not None:
             invalid_df = invalid_df.cache()
             print(f"\n[Stage 4] Writing quarantine rows...")
-            write_status("running", run_id, stage="Quarantine")
+            write_status("running", run_id, stage="Quarantine", dataset_type=dataset_type)
             quarantine_start_t = time.time()
             quarantine_count = write_quarantine(invalid_df, run_id=run_id, source_file=source_file, row_count=scorecard.get("invalid_rows", 0))
             quarantine_duration = time.time() - quarantine_start_t
@@ -379,7 +383,13 @@ def run_unified_pipeline():
             def export_quarantine_bg(q_df, q_count, r_id, s_file):
                 try:
                     if q_count > 0:
-                        from utils.s3_client import export_csv_bytes_to_s3
+                        from utils.s3_client import export_csv_bytes_to_s3, _get_bucket
+                        if _get_bucket() is None:
+                            print("[BG Quarantine Export] S3_BUCKET not configured. Skipping toPandas() export.")
+                            return
+                        if q_count > 50000:
+                            print(f"[BG Quarantine Export] Quarantine size {q_count} exceeds threshold. Skipping toPandas().")
+                            return
                         q_csv = q_df.toPandas().to_csv(index=False).encode('utf-8')
                         export_csv_bytes_to_s3(q_csv, f"quarantine/{r_id}/rejected_records.csv", run_id=r_id, row_count=q_count)
                 except Exception as ex:
@@ -395,10 +405,10 @@ def run_unified_pipeline():
         if should_fail:
             write_status("failed", run_id, stage="Validation",
                          error=f"DQ threshold exceeded. Score: {scorecard.get('dq_score', 0)}%",
-                         duration=time.time() - script_start_time)
+                         duration=time.time() - script_start_time, dataset_type=dataset_type)
             append_to_history("failed", run_id,
                               error=f"DQ threshold exceeded. Score: {scorecard.get('dq_score', 0)}%",
-                              duration=time.time() - script_start_time, rows=0)
+                              duration=time.time() - script_start_time, rows=0, dataset_type=dataset_type)
             try:
                 spark.catalog.clearCache()
             except Exception:
@@ -409,9 +419,9 @@ def run_unified_pipeline():
         # STAGE 5: Silver Transformation (valid rows only)
         # ============================================================
         print(f"\n[Stage 5] Silver Transformation...")
-        write_status("running", run_id, stage="Silver")
+        write_status("running", run_id, stage="Silver", dataset_type=dataset_type)
         silver_start_t = time.time()
-        silver_rows, silver_df = transform_silver(spark=spark, valid_df=valid_df, row_count=scorecard.get("valid_rows", 0))
+        silver_rows, silver_df = transform_silver(spark=spark, valid_df=valid_df, row_count=scorecard.get("valid_rows", 0), dataset_type=dataset_type)
         if silver_df is not None:
             silver_df = silver_df.cache()
         silver_duration = time.time() - silver_start_t
@@ -420,7 +430,13 @@ def run_unified_pipeline():
         def export_silver_bg(s_df, s_rows, r_id):
             try:
                 if s_df is not None and s_rows > 0:
-                    from utils.s3_client import export_csv_bytes_to_s3
+                    from utils.s3_client import export_csv_bytes_to_s3, _get_bucket
+                    if _get_bucket() is None:
+                        print("[BG Silver Export] S3_BUCKET not configured. Skipping toPandas() export.")
+                        return
+                    if s_rows > 50000:
+                        print(f"[BG Silver Export] Silver size {s_rows} exceeds threshold. Skipping toPandas().")
+                        return
                     csv_data = s_df.toPandas().to_csv(index=False).encode('utf-8')
                     export_csv_bytes_to_s3(csv_data, f"exports/{r_id}/cleaned_dataset.csv", run_id=r_id, row_count=s_rows)
             except Exception as ex:
@@ -437,7 +453,7 @@ def run_unified_pipeline():
         # STAGE 6: Gold Metrics (enriched)
         # ============================================================
         print(f"\n[Stage 6] Gold Metrics Generation...")
-        write_status("running", run_id, stage="Gold")
+        write_status("running", run_id, stage="Gold", dataset_type=dataset_type)
         gold_start_t = time.time()
         duration_so_far = time.time() - script_start_time
         business_df = generate_gold(
@@ -447,21 +463,26 @@ def run_unified_pipeline():
             mappings=mappings,
             run_id=run_id,
             runtime_seconds=duration_so_far,
-            silver_df=silver_df
+            silver_df=silver_df,
+            dataset_type=dataset_type
         )
         gold_duration = time.time() - gold_start_t
 
         # Start Gold Report S3 export concurrently
-        def export_gold_bg(s_session, b_df, sc, r_id):
+        def export_gold_bg(s_session, b_df, sc, r_id, d_type):
             try:
-                from utils.s3_client import export_text_to_s3
+                from utils.s3_client import export_text_to_s3, _get_bucket
+                if _get_bucket() is None:
+                    print("[BG Gold Export] S3_BUCKET not configured. Skipping gold report export.")
+                    return
                 from dashboard.queries import get_gold_report_data, generate_txt_report
                 gold_p_df = b_df.toPandas() if b_df is not None else None
                 report_data = get_gold_report_data(
                     s_session,
                     bronze_count=sc.get("total_rows"),
                     silver_count=sc.get("valid_rows"),
-                    gold_df=gold_p_df
+                    gold_df=gold_p_df,
+                    dataset_type=d_type
                 )
                 if report_data:
                     txt_report = generate_txt_report(report_data)
@@ -471,7 +492,7 @@ def run_unified_pipeline():
 
         t_gold = threading.Thread(
             target=export_gold_bg,
-            args=(spark, business_df, scorecard, run_id)
+            args=(spark, business_df, scorecard, run_id, dataset_type)
         )
         t_gold.start()
         bg_threads.append(t_gold)
@@ -480,7 +501,7 @@ def run_unified_pipeline():
         # STAGE 7: S3 Exports & Report Generation (Await Concurrent)
         # ============================================================
         print(f"\n[Stage 7] Awaiting concurrent S3 exports...")
-        write_status("running", run_id, stage="S3 Export")
+        write_status("running", run_id, stage="S3 Export", dataset_type=dataset_type)
         s3_export_start_t = time.time()
         for t in bg_threads:
             t.join(timeout=3.0)
@@ -509,9 +530,9 @@ def run_unified_pipeline():
         # Success
         # ============================================================
         final_rows = silver_rows or scorecard.get("valid_rows", 0)
-        write_status("completed", run_id, stage="Finished", duration=duration)
+        write_status("completed", run_id, stage="Finished", duration=duration, dataset_type=dataset_type)
         append_to_history("completed", run_id, file_name=source_file,
-                          duration=duration, rows=final_rows)
+                          duration=duration, rows=final_rows, dataset_type=dataset_type)
 
         # Sync results back to original storage
         if use_fast_io:

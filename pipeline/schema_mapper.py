@@ -1,13 +1,13 @@
 """
 Schema Mapper
 =============
-Reads the dq_config.yaml aliases table and renames incoming DataFrame columns
-to the canonical schema expected by the pipeline. Logs all mappings.
+Reads the dq_config.yaml registry aliases and renames incoming DataFrame columns
+to the canonical schema expected by the active dataset mode. Logs all mappings.
 """
 import os
 import yaml
+import json
 from pyspark.sql import DataFrame
-
 
 def _load_config():
     """Load dq_config.yaml. Searches standard locations."""
@@ -20,24 +20,39 @@ def _load_config():
         if path and os.path.exists(path):
             with open(path, "r") as f:
                 return yaml.safe_load(f)
-    # Minimal fallback if YAML not found
-    return {
-        "schema_aliases": {
-            "id": ["id", "ID", "user_id", "customer_id", "uid"],
-            "name": ["name", "full_name", "customer_name"],
-            "age": ["age", "customer_age", "user_age"],
-        }
-    }
+    return {}
 
-
-def apply_schema_mapping(df: DataFrame, run_id: str = "unknown", source_file: str = "unknown"):
+def apply_schema_mapping(df: DataFrame, dataset_type: str, run_id: str = "unknown", source_file: str = "unknown"):
     """
-    Inspect df columns and rename any aliases to canonical names.
+    Inspect df columns and rename any aliases to canonical names based on dataset type.
     Returns (mapped_df, mappings_applied, unresolved_columns)
-    where mappings_applied is a list of {from_col, to_col} dicts.
     """
+    if dataset_type == "GENERIC":
+        # No mapping applied for Generic datasets
+        unresolved = [c for c in df.columns if c not in ["ingestion_time", "source_file"]]
+        _log_mappings([], unresolved, run_id, source_file, df.sparkSession)
+        return df, [], unresolved
+
     config = _load_config()
-    aliases: dict = config.get("schema_aliases", {})
+    registry = config.get("registry", {
+        "CUSTOMER": {
+            "aliases": {
+                "id": ["id", "ID", "user_id", "customer_id", "record_id", "uid", "userId", "customerId"],
+                "name": ["name", "full_name", "customer_name", "user_name", "fullname", "displayName", "display_name"],
+                "age": ["age", "customer_age", "user_age", "years_old", "Age"]
+            }
+        },
+        "ORDERS": {
+            "aliases": {
+                "order_id": ["order_id", "orderId", "orderNo", "order_no", "orderid"],
+                "product_name": ["product_name", "product", "item_name", "item", "productName"],
+                "quantity": ["quantity", "qty", "units", "count", "quantity_ordered"],
+                "unit_price": ["unit_price", "price", "unitPrice", "rate", "unitprice"]
+            }
+        }
+    })
+
+    aliases = registry.get(dataset_type, {}).get("aliases", {})
 
     # Build reverse lookup: alias → canonical
     reverse_map = {}
@@ -45,11 +60,10 @@ def apply_schema_mapping(df: DataFrame, run_id: str = "unknown", source_file: st
         for alias in alias_list:
             reverse_map[alias.lower()] = canonical
 
-    actual_columns = {c: c for c in df.columns}
     mappings_applied = []
     unresolved = []
-
     rename_map = {}
+
     for col in df.columns:
         canonical = reverse_map.get(col.lower())
         if canonical and canonical != col:
@@ -58,7 +72,6 @@ def apply_schema_mapping(df: DataFrame, run_id: str = "unknown", source_file: st
         elif canonical == col:
             pass  # Already canonical name
         else:
-            # Column does not match any alias
             if col not in ["ingestion_time", "source_file"]:
                 unresolved.append(col)
 
@@ -72,15 +85,12 @@ def apply_schema_mapping(df: DataFrame, run_id: str = "unknown", source_file: st
 
     return mapped_df, mappings_applied, unresolved
 
-
 def _log_mappings(mappings, unresolved, run_id, source_file, spark):
     """Append schema mapping log directly using Pandas to avoid Spark job overhead."""
     try:
         import time
-        import os
         import pandas as pd
         import uuid
-        import json
         from pipeline.config import SCHEMA_MAP_LOG_PATH
 
         records = [{
@@ -93,11 +103,9 @@ def _log_mappings(mappings, unresolved, run_id, source_file, spark):
         
         os.makedirs(SCHEMA_MAP_LOG_PATH, exist_ok=True)
         pdf = pd.DataFrame(records)
-        # Write directly to a unique parquet file in the path
         pdf.to_parquet(os.path.join(SCHEMA_MAP_LOG_PATH, f"part-py-{uuid.uuid4().hex}.snappy.parquet"), index=False)
     except Exception as e:
         print(f"[SchemaMapper] Warning: Could not write mapping log: {e}")
-
 
 def get_mapping_summary(mappings: list, unresolved: list) -> str:
     """Human-readable summary of schema mappings for dashboard display."""

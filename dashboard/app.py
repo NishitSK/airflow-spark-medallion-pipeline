@@ -247,6 +247,15 @@ if page == "Pipeline Dashboard":
     st.title("📊 Self-Service Medallion Data Platform")
     st.divider()
     
+    from queries import get_latest_dataset_type
+    dataset_type = get_latest_dataset_type()
+    if dataset_type == "CUSTOMER":
+        st.info("🔹 **Active Pipeline Mode:** `CUSTOMER` (Strict Schema Mode)")
+    elif dataset_type == "ORDERS":
+        st.info("🔸 **Active Pipeline Mode:** `ORDERS` (Strict Schema Mode)")
+    else:
+        st.info("⚙️ **Active Pipeline Mode:** `GENERIC` (Flexible Generic Mode)")
+        
     # Display friendly system connection error banner at the top if validation failed
     if st.session_state.connection_verified is False:
         st.error(f"⚠️ {st.session_state.connection_error or 'Pipeline scheduler is currently offline.'}")
@@ -934,8 +943,21 @@ if page == "Pipeline Dashboard":
     with tabs[1]:
         df = load_layer_data(spark, SILVER_PATH)
         if df is not None:
-            from queries import col
-            df_sorted = df.orderBy(col("processed_date").desc(), col("id"))
+            from queries import col, get_latest_dataset_type, get_latest_successful_run_id, get_dq_run_report
+            
+            # Read dataset type
+            latest_run_id = get_latest_successful_run_id()
+            dq_report = get_dq_run_report(spark, run_id=latest_run_id) if latest_run_id else None
+            dataset_type = dq_report.get("dataset_type", "CUSTOMER") if dq_report else get_latest_dataset_type()
+            
+            sort_cols = [col("processed_date").desc()]
+            cols_list = df.df.columns
+            if "id" in cols_list:
+                sort_cols.append(col("id"))
+            elif "order_id" in cols_list:
+                sort_cols.append(col("order_id"))
+                
+            df_sorted = df.orderBy(*sort_cols)
             full_pdf = df_sorted.toPandas()
             total_cleaned = len(full_pdf)
             
@@ -950,7 +972,8 @@ if page == "Pipeline Dashboard":
                         mime="text/csv",
                         type="primary"
                     )
-                if 'age' in full_pdf.columns:
+                
+                if dataset_type == "CUSTOMER" and 'age' in full_pdf.columns:
                     with col_slider:
                         age_range = st.slider("Interactive Filter: Select Age Scope", 0, 120, (18, 65), key="silver_age_slider")
                     
@@ -964,9 +987,33 @@ if page == "Pipeline Dashboard":
                     
                     display_pdf = filtered_pdf.head(1000)
                     st.plotly_chart(plot_age_distribution(display_pdf), use_container_width=True)
+                elif dataset_type == "ORDERS" and 'unit_price' in full_pdf.columns:
+                    price_min = float(full_pdf['unit_price'].min()) if pd.notnull(full_pdf['unit_price'].min()) else 0.0
+                    price_max = float(full_pdf['unit_price'].max()) if pd.notnull(full_pdf['unit_price'].max()) else 1000.0
+                    with col_slider:
+                        price_range = st.slider("Interactive Filter: Select Price Scope ($)", price_min, price_max, (price_min, price_max), key="silver_price_slider")
+                    filtered_pdf = full_pdf[(full_pdf['unit_price'] >= price_range[0]) & (full_pdf['unit_price'] <= price_range[1])]
+                    
+                    # Statistics Metrics
+                    m_rev, m_ord, m_avg = st.columns(3)
+                    total_orders = filtered_pdf['order_id'].nunique() if 'order_id' in filtered_pdf.columns else len(filtered_pdf)
+                    if 'quantity' in filtered_pdf.columns and 'unit_price' in filtered_pdf.columns:
+                        total_revenue = (filtered_pdf['quantity'] * filtered_pdf['unit_price']).sum()
+                        avg_val = total_revenue / total_orders if total_orders > 0 else 0.0
+                    else:
+                        total_revenue = 0.0
+                        avg_val = 0.0
+                        
+                    m_rev.metric("Total Revenue", f"${total_revenue:,.2f}")
+                    m_ord.metric("Unique Orders", f"{total_orders:,}")
+                    m_avg.metric("Avg Order Value", f"${avg_val:,.2f}")
+                    
+                    display_pdf = filtered_pdf.head(1000)
+                    st.plotly_chart(plot_product_volume(display_pdf), use_container_width=True)
                 else:
                     filtered_pdf = full_pdf
                     display_pdf = filtered_pdf.head(1000)
+                    st.caption("Showing preview of Generic Silver dataset. All columns are preserved, whitespaces trimmed, and data types inferred/casted dynamically.")
                 
                 st.dataframe(display_pdf.head(100), use_container_width=True)
         else:
@@ -976,23 +1023,91 @@ if page == "Pipeline Dashboard":
         df = load_layer_data(spark, GOLD_PATH)
         if df:
             pdf = df.toPandas()
+            from queries import get_latest_dataset_type, get_latest_successful_run_id, get_dq_run_report
+            latest_run_id = get_latest_successful_run_id()
+            dq_report = get_dq_run_report(spark, run_id=latest_run_id) if latest_run_id else None
+            dataset_type = dq_report.get("dataset_type", "CUSTOMER") if dq_report else get_latest_dataset_type()
+            
             with st.container(border=True):
-                # Summary Statistics for Gold
-                g1, g2, g3 = st.columns(3)
-                if 'average_age' in pdf.columns:
-                    g1.metric("Average Gold Age", f"{pdf['average_age'].mean():.1f} yrs" if not pdf.empty and pd.notnull(pdf['average_age'].mean()) else "N/A")
+                if dataset_type == "CUSTOMER":
+                    # Summary Statistics for Gold
+                    g1, g2, g3 = st.columns(3)
+                    if 'average_age' in pdf.columns:
+                        g1.metric("Average Gold Age", f"{pdf['average_age'].mean():.1f} yrs" if not pdf.empty and pd.notnull(pdf['average_age'].mean()) else "N/A")
+                    else:
+                        g1.metric("Average Gold Age", "N/A")
+                    
+                    if 'total_users' in pdf.columns:
+                        g2.metric("Total Managed Users", f"{pdf['total_users'].sum():,}" if not pdf.empty else "N/A")
+                    else:
+                        g2.metric("Total Managed Users", "N/A")
+                    g3.metric("Aggregated Dates", f"{len(pdf)}" if not pdf.empty else "N/A")
+                    
+                    if 'average_age' in pdf.columns:
+                        st.plotly_chart(plot_gold_trends(pdf), use_container_width=True)
+                    st.dataframe(pdf, use_container_width=True)
+                elif dataset_type == "ORDERS":
+                    # Summary Statistics for Gold
+                    g1, g2, g3 = st.columns(3)
+                    if 'total_orders' in pdf.columns:
+                        g1.metric("Total Managed Orders", f"{pdf['total_orders'].sum():,}" if not pdf.empty else "0")
+                    else:
+                        g1.metric("Total Managed Orders", "0")
+                    
+                    if 'total_revenue' in pdf.columns:
+                        g2.metric("Total Managed Revenue", f"${pdf['total_revenue'].sum():,.2f}" if not pdf.empty else "$0.00")
+                    else:
+                        g2.metric("Total Managed Revenue", "$0.00")
+                    g3.metric("Aggregated Dates", f"{len(pdf)}" if not pdf.empty else "0")
+                    
+                    st.plotly_chart(plot_orders_trends(pdf), use_container_width=True)
+                    st.dataframe(pdf, use_container_width=True)
                 else:
-                    g1.metric("Average Gold Age", "N/A")
-                
-                if 'total_users' in pdf.columns:
-                    g2.metric("Total Managed Users", f"{pdf['total_users'].sum():,}" if not pdf.empty else "N/A")
-                else:
-                    g2.metric("Total Managed Users", "N/A")
-                g3.metric("Aggregated Dates", f"{len(pdf)}" if not pdf.empty else "N/A")
-                
-                if 'average_age' in pdf.columns:
-                    st.plotly_chart(plot_gold_trends(pdf), use_container_width=True)
-                st.dataframe(pdf, use_container_width=True)
+                    g1, g2, g3, g4 = st.columns(4)
+                    if 'total_rows' in pdf.columns:
+                        g1.metric("Total Ingested Rows", f"{int(pdf['total_rows'].iloc[0]):,}" if not pdf.empty else "0")
+                    else:
+                        g1.metric("Total Ingested Rows", "0")
+                        
+                    if 'total_columns' in pdf.columns:
+                        g2.metric("Total Ingested Columns", f"{int(pdf['total_columns'].iloc[0])}" if not pdf.empty else "0")
+                    else:
+                        g2.metric("Total Ingested Columns", "0")
+                        
+                    if 'completeness_score' in pdf.columns:
+                        g3.metric("Dataset Completeness", f"{pdf['completeness_score'].iloc[0]:.2f}%" if not pdf.empty else "N/A")
+                    else:
+                        g3.metric("Dataset Completeness", "N/A")
+                        
+                    if 'duplicate_rate' in pdf.columns:
+                        g4.metric("Duplicate Rate", f"{pdf['duplicate_rate'].iloc[0]:.2f}%" if not pdf.empty else "N/A")
+                    else:
+                        g4.metric("Duplicate Rate", "N/A")
+                        
+                    if not pdf.empty and 'column_metrics' in pdf.columns:
+                        col_metrics_str = pdf['column_metrics'].iloc[0]
+                        try:
+                            column_metrics_dict = json.loads(col_metrics_str) if isinstance(col_metrics_str, str) else col_metrics_str
+                            if column_metrics_dict:
+                                st.markdown("##### 📁 Column Inventory and Profiling")
+                                inventory_data = []
+                                for col_name, metrics in column_metrics_dict.items():
+                                    inventory_data.append({
+                                        "Column Name": col_name,
+                                        "Datatype": metrics.get("datatype", "string"),
+                                        "Null Count": metrics.get("null_count", 0),
+                                        "Null Percentage": f"{metrics.get('null_percentage', 0.0):.2f}%",
+                                        "Distinct Count": metrics.get("distinct_count", 0)
+                                    })
+                                st.dataframe(pd.DataFrame(inventory_data), use_container_width=True, hide_index=True)
+                                
+                                st.plotly_chart(plot_generic_nulls(column_metrics_dict), use_container_width=True)
+                                if 'duplicate_rate' in pdf.columns:
+                                    st.plotly_chart(plot_generic_duplicates(float(pdf['duplicate_rate'].iloc[0])), use_container_width=True)
+                        except Exception as e:
+                            st.caption(f"Could not parse column metrics: {e}")
+                    
+                    st.dataframe(pdf, use_container_width=True)
         else:
             st.info("Gold layer metrics are currently empty.")
 
@@ -1154,64 +1269,62 @@ elif page == "Delta Lake Transaction Log":
             st.subheader("Processing Volume History")
             df_files = pd.DataFrame(file_data)
             df_files = df_files[df_files["Rows Written"] > 0]
-            if not df_files.empty:
-                with st.container(border=True):
-                    st.bar_chart(df_files.set_index("Timestamp")["Rows Written"])
-        else:
-            st.info("No processing history found in Delta catalog.")
-            
-    except Exception as e:
-        st.error(f"Error loading Delta history: {str(e)}")
-
-elif page == "Data Quality & Observability":
-    from queries import col, read_delta_pandas
+      elif page == "Data Quality & Observability":
+    from queries import col, read_delta_pandas, get_latest_dataset_type, get_latest_successful_run_id, get_dq_run_report
     
     st.title("🛡️ Data Quality & Observability Portal")
     st.write("Comprehensive metrics, lineages, and audit trails generated from your Lakehouse layers.")
     
-    # Calculate counts
-    bronze_df = read_delta_pandas(BRONZE_PATH, columns=["id"])
-    silver_df = read_delta_pandas(SILVER_PATH, columns=["id"])
-    gold_df = read_delta_pandas(GOLD_PATH, columns=["processed_date"])
-    bronze_cnt = len(bronze_df) if not bronze_df.empty else 0
-    silver_cnt = len(silver_df) if not silver_df.empty else 0
-    gold_cnt = len(gold_df) if not gold_df.empty else 0
+    # Calculate counts safely
+    def get_count_safely(path):
+        try:
+            if not os.path.exists(path):
+                return 0
+            df = read_delta_pandas(path)
+            return len(df)
+        except:
+            return 0
+            
+    bronze_cnt = get_count_safely(BRONZE_PATH)
+    silver_cnt = get_count_safely(SILVER_PATH)
+    gold_cnt = get_count_safely(GOLD_PATH)
     
-    # Fetch latest validation metrics from dq_metrics path
-    latest_dq = None
-    try:
-        if os.path.exists(DQ_METRICS_PATH):
-            dq_df = read_delta_pandas(DQ_METRICS_PATH)
-            if not dq_df.empty:
-                dq_df = dq_df.sort_values("validation_time", ascending=False).head(1)
-                latest_dq = dq_df.iloc[0]
-            if not dq_df.empty:
-                latest_dq = dq_df.iloc[0]
-    except Exception as e:
-        print(f"Error reading DQ metrics: {e}")
+    latest_run_id = get_latest_successful_run_id()
+    latest_dq_report = get_dq_run_report(spark, run_id=latest_run_id) if latest_run_id else None
+    
+    if latest_dq_report:
+        dataset_type = latest_dq_report.get("dataset_type", "GENERIC")
+        total_validated = int(float(latest_dq_report.get("total_rows", 0) or 0))
+        failed_records = int(float(latest_dq_report.get("invalid_rows", 0) or 0))
+        passed_records = int(float(latest_dq_report.get("valid_rows", 0) or 0))
+        dq_score = float(latest_dq_report.get("dq_score", 100.0) or 100.0)
         
-    # Calculate passed and failed values based on latest dq run
-    if latest_dq is not None:
-        total_validated = int(latest_dq["total_rows"])
-        null_ids = int(latest_dq["null_ids"])
-        invalid_ages = int(latest_dq["invalid_ages"])
-        duplicate_ids = int(latest_dq["duplicate_ids"])
+        null_rate = 0.0
+        dup_rate = 0.0
+        inv_age_rate = 0.0
         
-        failed_records = null_ids + invalid_ages + duplicate_ids
-        passed_records = max(0, total_validated - failed_records)
-        
-        null_rate = (null_ids / total_validated * 100) if total_validated > 0 else 0.0
-        dup_rate = (duplicate_ids / total_validated * 100) if total_validated > 0 else 0.0
-        inv_age_rate = (invalid_ages / total_validated * 100) if total_validated > 0 else 0.0
-        
-        dq_score = (passed_records / total_validated * 100) if total_validated > 0 else 100.0
+        if dataset_type == "CUSTOMER":
+            null_ids = int(float(latest_dq_report.get("null_ids", 0) or 0))
+            duplicate_ids = int(float(latest_dq_report.get("duplicate_ids", 0) or 0))
+            invalid_ages = int(float(latest_dq_report.get("invalid_ages", 0) or 0))
+            
+            null_rate = (null_ids / total_validated * 100) if total_validated > 0 else 0.0
+            dup_rate = (duplicate_ids / total_validated * 100) if total_validated > 0 else 0.0
+            inv_age_rate = (invalid_ages / total_validated * 100) if total_validated > 0 else 0.0
+        elif dataset_type == "ORDERS":
+            null_order_ids = int(float(latest_dq_report.get("null_order_ids", 0) or 0))
+            duplicate_ids = int(float(latest_dq_report.get("duplicate_ids", 0) or 0))
+            
+            null_rate = (null_order_ids / total_validated * 100) if total_validated > 0 else 0.0
+            dup_rate = (duplicate_ids / total_validated * 100) if total_validated > 0 else 0.0
+        else:
+            null_rate = 100.0 - float(latest_dq_report.get("completeness_score", 100.0) or 100.0)
+            dup_rate = float(latest_dq_report.get("duplicate_rate", 0.0) or 0.0)
     else:
+        dataset_type = get_latest_dataset_type()
         total_validated = bronze_cnt
         passed_records = silver_cnt
         failed_records = max(0, bronze_cnt - silver_cnt)
-        null_ids = 0
-        invalid_ages = 0
-        duplicate_ids = 0
         null_rate = 0.0
         dup_rate = 0.0
         inv_age_rate = 0.0
@@ -1225,7 +1338,6 @@ elif page == "Data Quality & Observability":
         with st.container(border=True):
             st.subheader("🏥 Operational Monitoring")
             
-            # Connection statuses
             airflow_status = "🔴 Unavailable"
             import airflow_client
             health = airflow_client.get_airflow_health()
@@ -1234,7 +1346,6 @@ elif page == "Data Quality & Observability":
                     
             spark_status = "🟢 Available" if spark is not None else "🔴 Unavailable"
             
-            # Check Data Lake directories readability
             dl_status = "🟢 Accessible"
             for p in [BRONZE_PATH, SILVER_PATH, GOLD_PATH]:
                 if os.path.exists(p):
@@ -1261,17 +1372,32 @@ elif page == "Data Quality & Observability":
             
             if status == "Pipeline failed":
                 st.error("❌ Critical Data Quality Failure")
-                st.markdown(f"**Reason:** {error_msg or 'Validation threshold of 50.0% null IDs exceeded.'}")
-                st.markdown("**Threshold Limit:** Null ID rate ≥ 50.0%")
-                st.markdown("**Recommended Action:** The input file has been rejected. Inspect the source dataset file and ensure that the IDs are formatted correctly (i.e. integers or valid numeric representations). Check for malformed strings.")
+                st.markdown(f"**Reason:** {error_msg or 'Validation threshold exceeded.'}")
+                if dataset_type == "CUSTOMER":
+                    st.markdown("**Threshold Limit:** Null ID rate ≥ 50.0% or Min Rows < 1")
+                elif dataset_type == "ORDERS":
+                    st.markdown("**Threshold Limit:** Conformance checks or Min Rows < 1")
+                else:
+                    st.markdown("**Threshold Limit:** Min Rows threshold failure.")
+                st.markdown("**Recommended Action:** The input file has been rejected. Inspect the source dataset file and verify fields format.")
             elif failed_records > 0:
                 st.warning("⚠️ Data Quality Warning")
-                st.markdown(f"**Reason:** Data contains {failed_records} anomalous records ({null_ids} Null/Malformed IDs, {invalid_ages} Invalid Ages, and {duplicate_ids} Duplicate IDs).")
+                if dataset_type == "CUSTOMER":
+                    st.markdown(f"**Reason:** Data contains {failed_records} anomalous records ({null_ids} Null/Malformed IDs, {invalid_ages} Invalid Ages, and {duplicate_ids} Duplicate IDs).")
+                elif dataset_type == "ORDERS":
+                    st.markdown(f"**Reason:** Data contains {failed_records} anomalous records.")
+                else:
+                    st.markdown(f"**Reason:** Data contains duplicate rows.")
                 st.markdown("**Recommended Action:** The pipeline completed successfully by automatically cleansing and resolving these anomalies (Silver layer). However, verify upstream systems to improve source data completeness.")
             else:
                 st.success("🟢 Data Quality Healthy")
-                st.markdown("**Reason:** 100% of processed records successfully conformed to data quality standards.")
-                st.markdown("**Audit Details:** 0 nulls, 0 invalid ages, and 0 duplicate IDs detected in the active ingestion batch.")
+                st.markdown("**Reason:** 100% of processed records conformed to data quality standards.")
+                if dataset_type == "CUSTOMER":
+                    st.markdown("**Audit Details:** 0 nulls, 0 invalid ages, and 0 duplicate IDs detected.")
+                elif dataset_type == "ORDERS":
+                    st.markdown("**Audit Details:** 0 nulls, 0 invalid quantities/prices, and 0 duplicate orders detected.")
+                else:
+                    st.markdown("**Audit Details:** 0 missing cells and 0 duplicate rows detected in the active batch.")
 
     # ----------------- SECTION 2: LINEAGE FLOW VIEW -----------------
     st.divider()
@@ -1316,44 +1442,107 @@ elif page == "Data Quality & Observability":
     st.divider()
     st.subheader("🎯 Data Quality Scorecard")
     with st.container(border=True):
-        kpi_score, kpi_null, kpi_dupe, kpi_age, kpi_pass, kpi_fail = st.columns(6)
-        kpi_score.metric("Overall DQ Score", f"{dq_score:.2f}%")
-        kpi_null.metric("Null ID Rate", f"{null_rate:.2f}%")
-        kpi_dupe.metric("Duplicate ID Rate", f"{dup_rate:.2f}%")
-        kpi_age.metric("Invalid Age Rate", f"{inv_age_rate:.2f}%")
-        kpi_pass.metric("Records Passed", f"{passed_records:,}")
-        kpi_fail.metric("Records Failed", f"{failed_records:,}")
+        if dataset_type == "CUSTOMER":
+            kpi_score, kpi_null, kpi_dupe, kpi_age, kpi_pass, kpi_fail = st.columns(6)
+            kpi_score.metric("Overall DQ Score", f"{dq_score:.2f}%")
+            kpi_null.metric("Null ID Rate", f"{null_rate:.2f}%")
+            kpi_dupe.metric("Duplicate ID Rate", f"{dup_rate:.2f}%")
+            kpi_age.metric("Invalid Age Rate", f"{inv_age_rate:.2f}%")
+            kpi_pass.metric("Records Passed", f"{passed_records:,}")
+            kpi_fail.metric("Records Failed", f"{failed_records:,}")
+        elif dataset_type == "ORDERS":
+            kpi_score, kpi_null, kpi_dupe, kpi_qty, kpi_price, kpi_pass, kpi_fail = st.columns(7)
+            kpi_score.metric("Overall DQ Score", f"{dq_score:.2f}%")
+            
+            tot_val = max(1, total_validated)
+            qty_rate = (int(latest_dq_report.get("invalid_qty", 0)) / tot_val * 100.0) if latest_dq_report else 0.0
+            price_rate = (int(latest_dq_report.get("invalid_price", 0)) / tot_val * 100.0) if latest_dq_report else 0.0
+            
+            kpi_null.metric("Null ID Rate", f"{null_rate:.2f}%")
+            kpi_dupe.metric("Duplicate ID Rate", f"{dup_rate:.2f}%")
+            kpi_qty.metric("Invalid Qty Rate", f"{qty_rate:.2f}%")
+            kpi_price.metric("Invalid Price Rate", f"{price_rate:.2f}%")
+            kpi_pass.metric("Records Passed", f"{passed_records:,}")
+            kpi_fail.metric("Records Failed", f"{failed_records:,}")
+        else:
+            kpi_score, kpi_comp, kpi_dupe, kpi_cols, kpi_pass = st.columns(5)
+            comp_score = float(latest_dq_report.get("completeness_score", 100.0)) if latest_dq_report else 100.0
+            total_cols = int(latest_dq_report.get("total_columns", 0)) if latest_dq_report else 0
+            
+            kpi_score.metric("Overall DQ Score", f"{dq_score:.2f}%")
+            kpi_comp.metric("Completeness Score", f"{comp_score:.2f}%")
+            kpi_dupe.metric("Duplicate Row Rate", f"{dup_rate:.2f}%")
+            kpi_cols.metric("Total Columns", f"{total_cols}")
+            kpi_pass.metric("Records Processed", f"{passed_records:,}")
 
     # ----------------- SECTION 4: DQ AUDIT PANEL -----------------
     st.divider()
     st.subheader("🔍 Data Quality Audit Panel")
     
     audit_details = get_dq_audit_details(spark)
-    col_audit_ids, col_audit_ages, col_audit_dupes = st.columns(3)
     
-    with col_audit_ids:
+    if dataset_type == "CUSTOMER":
+        col_audit_ids, col_audit_ages, col_audit_dupes = st.columns(3)
+        with col_audit_ids:
+            with st.container(border=True):
+                st.markdown(f"##### 🔤 Malformed IDs ({audit_details.get('malformed_ids', {}).get('count', 0)})")
+                if audit_details.get('malformed_ids', {}).get('samples'):
+                    st.dataframe(pd.DataFrame(audit_details['malformed_ids']['samples']), hide_index=True, use_container_width=True)
+                else:
+                    st.success("No malformed IDs found in active raw data.")
+                    
+        with col_audit_ages:
+            with st.container(border=True):
+                st.markdown(f"##### 🔢 Malformed Ages ({audit_details.get('malformed_ages', {}).get('count', 0)})")
+                if audit_details.get('malformed_ages', {}).get('samples'):
+                    st.dataframe(pd.DataFrame(audit_details['malformed_ages']['samples']), hide_index=True, use_container_width=True)
+                else:
+                    st.success("No malformed ages found in active raw data.")
+                    
+        with col_audit_dupes:
+            with st.container(border=True):
+                st.markdown(f"##### 👥 Duplicate Keys ({audit_details.get('duplicate_ids', {}).get('count', 0)})")
+                if audit_details.get('duplicate_ids', {}).get('samples'):
+                    st.dataframe(pd.DataFrame(audit_details['duplicate_ids']['samples']), hide_index=True, use_container_width=True)
+                else:
+                    st.success("No duplicate keys found in active raw data.")
+    elif dataset_type == "ORDERS":
+        col_audit_ids, col_audit_qty, col_audit_price, col_audit_dupes = st.columns(4)
+        with col_audit_ids:
+            with st.container(border=True):
+                st.markdown(f"##### 🔤 Missing Order IDs ({audit_details.get('malformed_order_ids', {}).get('count', 0)})")
+                if audit_details.get('malformed_order_ids', {}).get('samples'):
+                    st.dataframe(pd.DataFrame(audit_details['malformed_order_ids']['samples']), hide_index=True, use_container_width=True)
+                else:
+                    st.success("No missing order IDs.")
+        with col_audit_qty:
+            with st.container(border=True):
+                st.markdown(f"##### 🔢 Invalid Quantities ({audit_details.get('invalid_qty', {}).get('count', 0)})")
+                if audit_details.get('invalid_qty', {}).get('samples'):
+                    st.dataframe(pd.DataFrame(audit_details['invalid_qty']['samples']), hide_index=True, use_container_width=True)
+                else:
+                    st.success("No invalid quantities.")
+        with col_audit_price:
+            with st.container(border=True):
+                st.markdown(f"##### 💲 Invalid Prices ({audit_details.get('invalid_price', {}).get('count', 0)})")
+                if audit_details.get('invalid_price', {}).get('samples'):
+                    st.dataframe(pd.DataFrame(audit_details['invalid_price']['samples']), hide_index=True, use_container_width=True)
+                else:
+                    st.success("No invalid prices.")
+        with col_audit_dupes:
+            with st.container(border=True):
+                st.markdown(f"##### 👥 Duplicate Orders ({audit_details.get('duplicate_orders', {}).get('count', 0)})")
+                if audit_details.get('duplicate_orders', {}).get('samples'):
+                    st.dataframe(pd.DataFrame(audit_details['duplicate_orders']['samples']), hide_index=True, use_container_width=True)
+                else:
+                    st.success("No duplicate order IDs.")
+    else:
         with st.container(border=True):
-            st.markdown(f"##### 🔤 Malformed IDs ({audit_details['malformed_ids']['count']})")
-            if audit_details['malformed_ids']['samples']:
-                st.dataframe(pd.DataFrame(audit_details['malformed_ids']['samples']), hide_index=True, use_container_width=True)
+            st.markdown(f"##### 📊 Null Analysis Per Column ({audit_details.get('column_nulls', {}).get('count', 0)} Columns with Nulls)")
+            if audit_details.get('column_nulls', {}).get('samples'):
+                st.dataframe(pd.DataFrame(audit_details['column_nulls']['samples']), hide_index=True, use_container_width=True)
             else:
-                st.success("No malformed IDs found in active raw data.")
-                
-    with col_audit_ages:
-        with st.container(border=True):
-            st.markdown(f"##### 🔢 Malformed Ages ({audit_details['malformed_ages']['count']})")
-            if audit_details['malformed_ages']['samples']:
-                st.dataframe(pd.DataFrame(audit_details['malformed_ages']['samples']), hide_index=True, use_container_width=True)
-            else:
-                st.success("No malformed ages found in active raw data.")
-                
-    with col_audit_dupes:
-        with st.container(border=True):
-            st.markdown(f"##### 👥 Duplicate Keys ({audit_details['duplicate_ids']['count']})")
-            if audit_details['duplicate_ids']['samples']:
-                st.dataframe(pd.DataFrame(audit_details['duplicate_ids']['samples']), hide_index=True, use_container_width=True)
-            else:
-                st.success("No duplicate keys found in active raw data.")
+                st.success("No null values found in any columns!")
 
     # ----------------- SECTION 5: DQ TREND ANALYSIS & LAYER STATISTICS -----------------
     st.divider()

@@ -1,7 +1,7 @@
 """
 Bronze Ingestion
 ================
-Reads raw CSV/JSON files, applies schema mapping to handle column aliases,
+Reads raw CSV/JSON files, detects schema type, applies schema mapping to handle column aliases,
 adds metadata, and writes to the Bronze Delta table in raw string format.
 """
 import sys
@@ -68,7 +68,7 @@ def ingest_bronze(spark=None, run_id="unknown", bg_threads=None):
             df = df_json
         else:
             print("[Bronze] No CSV or JSON files found in input path.")
-            return None, "unknown"
+            return None, "unknown", [], "GENERIC"
 
         print(f"[Bronze Timing] Reading files took: {time.time() - bronze_t0:.2f} seconds")
 
@@ -77,12 +77,17 @@ def ingest_bronze(spark=None, run_id="unknown", bg_threads=None):
             .withColumn("ingestion_time", current_timestamp()) \
             .withColumn("source_file", input_file_name())
 
-        # Apply schema mapping (alias resolution)
+        # Detect dataset type from raw columns
+        from pipeline.schema_validator import detect_dataset_type, validate_schema
+        dataset_type = detect_dataset_type(df)
+        print(f"[Bronze] Detected dataset type: {dataset_type}")
+
+        # Apply schema mapping (alias resolution) based on type
         map_t0 = time.time()
         try:
             from pipeline.schema_mapper import apply_schema_mapping
             source_file = csv_files[0] if csv_files else (json_files[0] if json_files else "unknown")
-            df, mappings, unresolved = apply_schema_mapping(df, run_id=run_id, source_file=source_file)
+            df, mappings, unresolved = apply_schema_mapping(df, dataset_type, run_id=run_id, source_file=source_file)
             if mappings:
                 print(f"[Bronze] Schema mappings applied: {mappings}")
             if unresolved:
@@ -92,8 +97,7 @@ def ingest_bronze(spark=None, run_id="unknown", bg_threads=None):
         print(f"[Bronze Timing] Schema mapping took: {time.time() - map_t0:.2f} seconds")
 
         # Validate schema after mapping aliases
-        from pipeline.schema_validator import validate_schema
-        validate_schema(df, source_file=source_file)
+        validate_schema(df, dataset_type, source_file=source_file)
 
         write_t0 = time.time()
         import threading
@@ -113,7 +117,7 @@ def ingest_bronze(spark=None, run_id="unknown", bg_threads=None):
             
         source_file = csv_files[0] if csv_files else (json_files[0] if json_files else "unknown")
         print(f"[Bronze Timing] Launched Bronze Delta write in background | Source: {source_file}")
-        return df, source_file, mappings
+        return df, source_file, mappings, dataset_type
 
     except Exception as e:
         print(f"[Bronze] Ingestion Failed: {str(e)}")

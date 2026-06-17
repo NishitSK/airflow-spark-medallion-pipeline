@@ -2,7 +2,7 @@
 Schema Validator
 ================
 Defines expected schema from configuration, validates incoming datasets,
-and writes a schema compatibility report.
+detects dataset type (CUSTOMER, ORDERS, or GENERIC), and writes a schema compatibility report.
 """
 import os
 import json
@@ -29,41 +29,90 @@ def _load_config():
                 print(f"[SchemaValidator] Warning loading config at {path}: {e}")
     return {}
 
-def validate_schema(df: DataFrame, source_file: str = "unknown") -> dict:
+def detect_dataset_type(df: DataFrame) -> str:
     """
-    Checks that the dataframe contains all required canonical columns.
+    Analyzes DataFrame columns to match them against known schemas (CUSTOMER, ORDERS).
+    Matches are case-insensitive and allow aliases. Falls back to GENERIC.
+    """
+    cols = [c.lower() for c in df.columns]
+    
+    # Define default registry in case config does not have it
+    config = _load_config()
+    registry = config.get("registry", {
+        "CUSTOMER": {
+            "required": ["id", "name", "age"],
+            "aliases": {
+                "id": ["id", "ID", "user_id", "customer_id", "record_id", "uid", "userId", "customerId"],
+                "name": ["name", "full_name", "customer_name", "user_name", "fullname", "displayName", "display_name"],
+                "age": ["age", "customer_age", "user_age", "years_old", "Age"]
+            }
+        },
+        "ORDERS": {
+            "required": ["order_id", "product_name", "quantity", "unit_price"],
+            "aliases": {
+                "order_id": ["order_id", "orderId", "orderNo", "order_no", "orderid"],
+                "product_name": ["product_name", "product", "item_name", "item", "productName"],
+                "quantity": ["quantity", "qty", "units", "count", "quantity_ordered"],
+                "unit_price": ["unit_price", "price", "unitPrice", "rate", "unitprice"]
+            }
+        }
+    })
+    
+    def matches_schema(required_cols, aliases):
+        for req in required_cols:
+            alias_list = [a.lower() for a in aliases.get(req, [])] + [req.lower()]
+            found = False
+            for a in alias_list:
+                if a in cols:
+                    found = True
+                    break
+            if not found:
+                return False
+        return True
+
+    if matches_schema(registry["CUSTOMER"]["required"], registry["CUSTOMER"]["aliases"]):
+        return "CUSTOMER"
+    elif matches_schema(registry["ORDERS"]["required"], registry["ORDERS"]["aliases"]):
+        return "ORDERS"
+    else:
+        return "GENERIC"
+
+def validate_schema(df: DataFrame, dataset_type: str, source_file: str = "unknown") -> dict:
+    """
+    Checks that the dataframe contains all required canonical columns for the active schema.
     Generates a schema compatibility report JSON file.
-    Raises SchemaValidationError if any required column is missing.
+    Only raises SchemaValidationError if missing required columns on known schemas.
     """
     config = _load_config()
-    columns_config = config.get("columns", {})
+    registry = config.get("registry", {
+        "CUSTOMER": {
+            "required": ["id", "name", "age"],
+        },
+        "ORDERS": {
+            "required": ["order_id", "product_name", "quantity", "unit_price"],
+        }
+    })
     
-    # 1. Determine expected required columns
-    required_cols = [col_name for col_name, col_cfg in columns_config.items() if col_cfg.get("required", False)]
-    
-    # If no configuration found, default to minimal required columns
-    if not required_cols:
-        required_cols = ["id", "name", "age"]
+    # 1. Determine expected required columns for this dataset type
+    is_supported = dataset_type in ["CUSTOMER", "ORDERS"]
+    required_cols = []
+    if is_supported:
+        required_cols = registry.get(dataset_type, {}).get("required", [])
         
     df_cols = df.columns
     found_cols = [col for col in required_cols if col in df_cols]
     missing_cols = [col for col in required_cols if col not in df_cols]
     
-    # Extra columns are anything in df that isn't expected (or metadata)
-    system_metadata = ["ingestion_time", "source_file"]
-    config_all_cols = list(columns_config.keys()) if columns_config else required_cols
-    extra_cols = [col for col in df_cols if col not in config_all_cols and col not in system_metadata]
-    
     # 2. Build report
     report = {
-        "source_file": source_file,
-        "required_columns_expected": required_cols,
-        "required_columns_found": found_cols,
-        "missing_required_columns": missing_cols,
-        "extra_columns_found": extra_cols,
-        "final_schema": df_cols,
-        "is_compatible": len(missing_cols) == 0
+        "dataset_type": dataset_type,
+        "is_supported": is_supported,
+        "found_columns": df_cols
     }
+    if is_supported:
+        report["expected_columns"] = required_cols
+        report["missing_required_columns"] = missing_cols
+        report["is_compatible"] = len(missing_cols) == 0
     
     # Save the compatibility report to the output directory
     try:
@@ -72,7 +121,7 @@ def validate_schema(df: DataFrame, source_file: str = "unknown") -> dict:
         os.makedirs(report_dir, exist_ok=True)
         report_path = os.path.join(report_dir, "schema_compatibility_report.json")
         
-        # Write report atomically to avoid partial file reads
+        # Write report atomically
         tmp_path = f"{report_path}.tmp"
         with open(tmp_path, "w") as f:
             json.dump(report, f, indent=4)
@@ -81,8 +130,8 @@ def validate_schema(df: DataFrame, source_file: str = "unknown") -> dict:
     except Exception as e:
         print(f"[SchemaValidator] Warning: Could not write compatibility report: {e}")
         
-    # 3. Fail if missing columns
-    if missing_cols:
+    # 3. Fail if missing columns on known schemas
+    if is_supported and missing_cols:
         if len(missing_cols) == 1:
             msg = f"Unsupported dataset schema. Missing required column: {missing_cols[0]}"
         else:

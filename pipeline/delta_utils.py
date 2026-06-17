@@ -17,8 +17,8 @@ def get_spark_session(app_name="MedallionPipeline", shuffle_partitions=1):
         .config("spark.databricks.delta.schema.autoMerge.enabled", "true") \
         .config("spark.sql.ansi.enabled", "false") \
         .config("spark.driver.extraJavaOptions", JAVA_OPTS) \
-        .config("spark.executor.memory", "512m") \
-        .config("spark.driver.memory", "512m") \
+        .config("spark.executor.memory", "1536m") \
+        .config("spark.driver.memory", "1536m") \
         .config("spark.ui.enabled", "false") \
         .config("spark.sql.adaptive.enabled", "false") \
         .config("spark.sql.parquet.compression.codec", "none") \

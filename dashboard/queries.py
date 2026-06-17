@@ -184,6 +184,27 @@ def get_spark():
     # Streamlit never creates a SparkSession
     return None
 
+def get_latest_dataset_type():
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE) as f:
+                d = json.load(f)
+                if "dataset_type" in d:
+                    return d["dataset_type"]
+        except:
+            pass
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE) as f:
+                lines = f.readlines()
+                if lines:
+                    last_record = json.loads(lines[-1].strip())
+                    if "dataset_type" in last_record:
+                        return last_record["dataset_type"]
+        except:
+            pass
+    return "GENERIC"
+
 @st.cache_data(ttl=10)
 def get_kpis(_spark=None):
     try:
@@ -194,8 +215,26 @@ def get_kpis(_spark=None):
                 if len(parts) >= 2: 
                     runtime_val = f"{float(parts[1]):.2f}"
 
-        df = read_delta_pandas(SILVER_PATH, columns=["id"])
-        total_unique = df["id"].nunique() if not df.empty else 0
+        dataset_type = get_latest_dataset_type()
+        
+        if dataset_type == "CUSTOMER":
+            df = read_delta_pandas(SILVER_PATH, columns=["id"])
+            total_unique = df["id"].nunique() if not df.empty else 0
+        elif dataset_type == "ORDERS":
+            df = read_delta_pandas(SILVER_PATH, columns=["order_id"])
+            total_unique = df["order_id"].nunique() if not df.empty else 0
+        else:
+            df = read_delta_pandas(SILVER_PATH)
+            if not df.empty:
+                non_meta_cols = [c for c in df.columns if c not in ["ingestion_time", "source_file", "processed_date"]]
+                id_col = non_meta_cols[0] if non_meta_cols else None
+                if id_col:
+                    total_unique = df[id_col].nunique()
+                else:
+                    total_unique = len(df)
+            else:
+                total_unique = 0
+                
         return runtime_val, total_unique
     except Exception as e:
         print(f"Error in get_kpis: {e}")
@@ -478,87 +517,160 @@ def get_pipeline_history(_spark=None):
 
 def get_dq_audit_details(spark=None):
     audit_data = {
+        "dataset_type": "GENERIC",
         "malformed_ids": {"count": 0, "samples": []},
         "malformed_ages": {"count": 0, "samples": []},
-        "duplicate_ids": {"count": 0, "samples": []}
+        "duplicate_ids": {"count": 0, "samples": []},
+        "malformed_order_ids": {"count": 0, "samples": []},
+        "invalid_qty": {"count": 0, "samples": []},
+        "invalid_price": {"count": 0, "samples": []},
+        "duplicate_orders": {"count": 0, "samples": []},
+        "column_nulls": {"count": 0, "samples": []}
     }
     
     try:
         if not os.path.exists(BRONZE_PATH):
             return audit_data
             
-        df = read_delta_pandas(BRONZE_PATH, columns=["id", "name", "age"])
-        total_rows = len(df)
-        if total_rows == 0:
+        df = read_delta_pandas(BRONZE_PATH)
+        if df.empty:
             return audit_data
             
-        # 1. Malformed IDs
+        dataset_type = get_latest_dataset_type()
+        audit_data["dataset_type"] = dataset_type
+        
         def to_int_safe(val):
             try:
                 if pd.isnull(val): return None
                 s = str(val).strip()
                 if s == "": return None
-                # Strip trailing decimals for formatting (e.g. 1005.0)
                 if s.endswith(".0"):
                     s = s[:-2]
                 return int(s)
             except:
                 return None
-
-        # Detect malformed IDs
-        if "id" in df.columns:
-            id_series = df["id"]
-            malformed_ids_mask = id_series.notnull() & (id_series.astype(str).str.strip() != "") & (id_series.apply(to_int_safe).isnull())
-            malformed_ids_df = df[malformed_ids_mask]
-            audit_data["malformed_ids"]["count"] = len(malformed_ids_df)
-            if len(malformed_ids_df) > 0:
-                cols_to_use = [c for c in ["id", "name"] if c in df.columns]
-                samples = malformed_ids_df[cols_to_use].head(5)
-                audit_data["malformed_ids"]["samples"] = samples.to_dict(orient="records")
-            
-        # 2. Malformed / Out-of-bounds Ages
-        def is_malformed_age_val(val):
+                
+        def to_float_safe(val):
             try:
-                if pd.isnull(val): return False
+                if pd.isnull(val): return None
                 s = str(val).strip()
-                if s == "": return False
-                if s.endswith(".0"):
-                    s = s[:-2]
-                v = int(s)
-                return v < 0 or v > 120
+                if s == "": return None
+                return float(s)
             except:
-                return True
+                return None
 
-        if "age" in df.columns:
-            age_series = df["age"]
-            malformed_ages_mask = age_series.notnull() & (age_series.astype(str).str.strip() != "") & (age_series.apply(is_malformed_age_val))
-            malformed_ages_df = df[malformed_ages_mask]
-            audit_data["malformed_ages"]["count"] = len(malformed_ages_df)
-            if len(malformed_ages_df) > 0:
-                cols_to_use = [c for c in ["age", "name"] if c in df.columns]
-                samples = malformed_ages_df[cols_to_use].head(5)
-                audit_data["malformed_ages"]["samples"] = samples.to_dict(orient="records")
-            
-        # 3. Duplicate IDs (on normalized ID)
-        if "id" in df.columns:
-            df["normalized_id"] = id_series.apply(lambda x: str(to_int_safe(x)) if to_int_safe(x) is not None else "")
-            valid_id_df = df[df["normalized_id"] != ""]
-            
-            dup_counts = valid_id_df["normalized_id"].value_counts()
-            dup_ids = dup_counts[dup_counts > 1].index.tolist()
-            
-            audit_data["duplicate_ids"]["count"] = len(dup_ids)
-            if len(dup_ids) > 0:
-                sample_df = valid_id_df[valid_id_df["normalized_id"].isin(dup_ids[:5])]
-                # Map columns
-                samples = []
-                for _, r in sample_df.iterrows():
-                    samples.append({
-                        "raw_id": r["id"],
-                        "name": r.get("name", "N/A"),
-                        "occurrences": dup_counts[r["normalized_id"]]
-                    })
-                audit_data["duplicate_ids"]["samples"] = samples[:5]
+        if dataset_type == "CUSTOMER":
+            if "id" in df.columns:
+                id_series = df["id"]
+                malformed_ids_mask = id_series.notnull() & (id_series.astype(str).str.strip() != "") & (id_series.apply(to_int_safe).isnull())
+                malformed_ids_df = df[malformed_ids_mask]
+                audit_data["malformed_ids"]["count"] = len(malformed_ids_df)
+                if len(malformed_ids_df) > 0:
+                    cols_to_use = [c for c in ["id", "name"] if c in df.columns]
+                    audit_data["malformed_ids"]["samples"] = malformed_ids_df[cols_to_use].head(5).to_dict(orient="records")
+                
+            def is_malformed_age_val(val):
+                try:
+                    if pd.isnull(val): return False
+                    s = str(val).strip()
+                    if s == "": return False
+                    if s.endswith(".0"):
+                        s = s[:-2]
+                    v = int(s)
+                    return v < 0 or v > 120
+                except:
+                    return True
+
+            if "age" in df.columns:
+                age_series = df["age"]
+                malformed_ages_mask = age_series.notnull() & (age_series.astype(str).str.strip() != "") & (age_series.apply(is_malformed_age_val))
+                malformed_ages_df = df[malformed_ages_mask]
+                audit_data["malformed_ages"]["count"] = len(malformed_ages_df)
+                if len(malformed_ages_df) > 0:
+                    cols_to_use = [c for c in ["age", "name"] if c in df.columns]
+                    audit_data["malformed_ages"]["samples"] = malformed_ages_df[cols_to_use].head(5).to_dict(orient="records")
+                
+            if "id" in df.columns:
+                df["normalized_id"] = id_series.apply(lambda x: str(to_int_safe(x)) if to_int_safe(x) is not None else "")
+                valid_id_df = df[df["normalized_id"] != ""]
+                dup_counts = valid_id_df["normalized_id"].value_counts()
+                dup_ids = dup_counts[dup_counts > 1].index.tolist()
+                
+                audit_data["duplicate_ids"]["count"] = len(dup_ids)
+                if len(dup_ids) > 0:
+                    sample_df = valid_id_df[valid_id_df["normalized_id"].isin(dup_ids[:5])]
+                    samples = []
+                    for _, r in sample_df.iterrows():
+                        samples.append({
+                            "raw_id": r["id"],
+                            "name": r.get("name", "N/A"),
+                            "occurrences": dup_counts[r["normalized_id"]]
+                        })
+                    audit_data["duplicate_ids"]["samples"] = samples[:5]
+                    
+        elif dataset_type == "ORDERS":
+            if "order_id" in df.columns:
+                null_mask = df["order_id"].isnull() | (df["order_id"].astype(str).str.strip() == "")
+                null_df = df[null_mask]
+                audit_data["malformed_order_ids"]["count"] = len(null_df)
+                if len(null_df) > 0:
+                    cols_to_use = [c for c in ["order_id", "product_name"] if c in df.columns]
+                    audit_data["malformed_order_ids"]["samples"] = null_df[cols_to_use].head(5).to_dict(orient="records")
+                    
+            if "quantity" in df.columns:
+                qty_series = df["quantity"]
+                invalid_qty_mask = qty_series.notnull() & (qty_series.astype(str).str.strip() != "") & (
+                    qty_series.apply(to_int_safe).isnull() | (qty_series.apply(to_int_safe) < 1)
+                )
+                invalid_qty_df = df[invalid_qty_mask]
+                audit_data["invalid_qty"]["count"] = len(invalid_qty_df)
+                if len(invalid_qty_df) > 0:
+                    cols_to_use = [c for c in ["order_id", "product_name", "quantity"] if c in df.columns]
+                    audit_data["invalid_qty"]["samples"] = invalid_qty_df[cols_to_use].head(5).to_dict(orient="records")
+                    
+            if "unit_price" in df.columns:
+                price_series = df["unit_price"]
+                invalid_price_mask = price_series.notnull() & (price_series.astype(str).str.strip() != "") & (
+                    price_series.apply(to_float_safe).isnull() | (price_series.apply(to_float_safe) < 0.0)
+                )
+                invalid_price_df = df[invalid_price_mask]
+                audit_data["invalid_price"]["count"] = len(invalid_price_df)
+                if len(invalid_price_df) > 0:
+                    cols_to_use = [c for c in ["order_id", "product_name", "unit_price"] if c in df.columns]
+                    audit_data["invalid_price"]["samples"] = invalid_price_df[cols_to_use].head(5).to_dict(orient="records")
+                    
+            if "order_id" in df.columns:
+                valid_ord_df = df[df["order_id"].notnull() & (df["order_id"].astype(str).str.strip() != "")]
+                dup_counts = valid_ord_df["order_id"].value_counts()
+                dup_ids = dup_counts[dup_counts > 1].index.tolist()
+                
+                audit_data["duplicate_orders"]["count"] = len(dup_ids)
+                if len(dup_ids) > 0:
+                    sample_df = valid_ord_df[valid_ord_df["order_id"].isin(dup_ids[:5])]
+                    samples = []
+                    for _, r in sample_df.iterrows():
+                        samples.append({
+                            "order_id": r["order_id"],
+                            "product_name": r.get("product_name", "N/A"),
+                            "occurrences": dup_counts[r["order_id"]]
+                        })
+                    audit_data["duplicate_orders"]["samples"] = samples[:5]
+                    
+        else:
+            null_counts = []
+            for col_name in df.columns:
+                if col_name in ["ingestion_time", "source_file", "processed_date"]:
+                    continue
+                nulls = df[col_name].isnull().sum() + (df[col_name].astype(str).str.strip() == "").sum()
+                pct = nulls / len(df) * 100.0 if len(df) > 0 else 0.0
+                null_counts.append({
+                    "column_name": col_name,
+                    "null_count": int(nulls),
+                    "null_pct": round(pct, 2)
+                })
+            null_counts.sort(key=lambda x: x["null_pct"], reverse=True)
+            audit_data["column_nulls"]["samples"] = null_counts[:10]
+            audit_data["column_nulls"]["count"] = sum(1 for x in null_counts if x["null_count"] > 0)
             
     except Exception as e:
         print(f"Error fetching DQ audit details: {str(e)}")
@@ -567,27 +679,68 @@ def get_dq_audit_details(spark=None):
 
 @st.cache_data(ttl=10)
 def get_dq_trends(_spark=None):
-    import numpy as np
+    try:
+        if os.path.exists(DQ_REPORT_PATH):
+            df = read_delta_pandas(DQ_REPORT_PATH)
+            if not df.empty:
+                order_col = "report_time" if "report_time" in df.columns else ("processed_at" if "processed_at" in df.columns else None)
+                if order_col:
+                    df = df.sort_values(order_col, ascending=True)
+                
+                df['Timestamp'] = pd.to_datetime(df[order_col]).dt.strftime('%m-%d %H:%M:%S')
+                df['Quality Score (%)'] = df['dq_score'].fillna(100.0)
+                
+                null_rates = []
+                dup_rates = []
+                other_rates = []
+                
+                for _, row in df.iterrows():
+                    d_type = row.get("dataset_type", "GENERIC")
+                    tot = float(row.get("total_rows", 1) or 1)
+                    if tot == 0:
+                        tot = 1.0
+                        
+                    if d_type == "CUSTOMER":
+                        null_rates.append(float(row.get("null_ids", 0) or 0) / tot * 100.0)
+                        dup_rates.append(float(row.get("duplicate_ids", 0) or 0) / tot * 100.0)
+                        other_rates.append(float(row.get("invalid_ages", 0) or 0) / tot * 100.0)
+                    elif d_type == "ORDERS":
+                        null_rates.append(float(row.get("null_order_ids", 0) or 0) / tot * 100.0)
+                        dup_rates.append(float(row.get("duplicate_ids", 0) or 0) / tot * 100.0)
+                        qty_f = float(row.get("invalid_qty", 0) or 0)
+                        price_f = float(row.get("invalid_price", 0) or 0)
+                        other_rates.append((qty_f + price_f) / tot * 100.0)
+                    else:
+                        comp = float(row.get("completeness_score", 100.0) or 100.0)
+                        null_rates.append(100.0 - comp)
+                        dup_rates.append(float(row.get("duplicate_rate", 0.0) or 0.0))
+                        other_rates.append(0.0)
+                        
+                df['Null Rate (%)'] = null_rates
+                df['Duplicate Rate (%)'] = dup_rates
+                df['Other Failure Rate (%)'] = other_rates
+                df['Failure Rate (%)'] = (df['invalid_rows'].astype(float) / df['total_rows'].astype(float).replace(0, 1) * 100.0).fillna(0.0)
+                
+                return df
+    except Exception as e:
+        print(f"Error fetching DQ trends from dq_run_report: {str(e)}")
+        
     try:
         if os.path.exists(DQ_METRICS_PATH):
             df = read_delta_pandas(DQ_METRICS_PATH)
             if not df.empty:
                 df = df.sort_values("validation_time", ascending=True)
-                total = df['total_rows'].replace(0, np.nan)
+                total = df['total_rows'].replace(0, 1)
                 
                 df['Null Rate (%)'] = (df['null_ids'] / total * 100).fillna(0.0)
                 df['Duplicate Rate (%)'] = (df['duplicate_ids'] / total * 100).fillna(0.0)
-                df['Invalid Age Rate (%)'] = (df['invalid_ages'] / total * 100).fillna(0.0)
-                
-                failed_records = df['null_ids'] + df['invalid_ages'] + df['duplicate_ids']
-                passed_records = (df['total_rows'] - failed_records).clip(lower=0)
-                df['Quality Score (%)'] = (passed_records / total * 100).fillna(100.0)
-                df['Failure Rate (%)'] = (failed_records / total * 100).fillna(0.0)
-                
+                df['Failure Rate (%)'] = ((df['null_ids'] + df['invalid_ages'] + df['duplicate_ids']) / total * 100).fillna(0.0)
+                df['Quality Score (%)'] = (100.0 - df['Failure Rate (%)']).clip(lower=0)
                 df['Timestamp'] = pd.to_datetime(df['validation_time']).dt.strftime('%m-%d %H:%M:%S')
                 return df
     except Exception as e:
-        print(f"Error fetching DQ trends: {str(e)}")
+        print(f"Error fetching legacy DQ trends: {str(e)}")
+        
     return pd.DataFrame()
 
 @st.cache_data(ttl=10)
@@ -673,7 +826,7 @@ def get_last_run_summary(_spark=None):
     return summary
 
 
-def get_gold_report_data(spark=None, bronze_count=None, silver_count=None, gold_df=None):
+def get_gold_report_data(spark=None, bronze_count=None, silver_count=None, gold_df=None, dataset_type=None):
     report_data = {
         "status": "N/A",
         "run_id": "N/A",
@@ -687,7 +840,9 @@ def get_gold_report_data(spark=None, bronze_count=None, silver_count=None, gold_
         "null_ids": 0,
         "invalid_ages": 0,
         "duplicate_ids": 0,
-        "gold_summary": None
+        "gold_summary": None,
+        "dataset_type": "GENERIC",
+        "dq_report": {}
     }
     
     last_record = None
@@ -726,7 +881,7 @@ def get_gold_report_data(spark=None, bronze_count=None, silver_count=None, gold_
     else:
         try:
             if os.path.exists(BRONZE_PATH):
-                report_data["rows_received"] = len(read_delta_pandas(BRONZE_PATH, columns=["id"]))
+                report_data["rows_received"] = len(read_delta_pandas(BRONZE_PATH))
         except Exception as e:
             print(f"Error fetching bronze count for report: {e}")
             
@@ -735,32 +890,45 @@ def get_gold_report_data(spark=None, bronze_count=None, silver_count=None, gold_
     else:
         try:
             if os.path.exists(SILVER_PATH):
-                report_data["rows_processed"] = len(read_delta_pandas(SILVER_PATH, columns=["id"]))
+                report_data["rows_processed"] = len(read_delta_pandas(SILVER_PATH))
         except Exception as e:
             print(f"Error fetching silver count for report: {e}")
             
     report_data["rows_rejected"] = max(0, report_data["rows_received"] - report_data["rows_processed"])
     
-    try:
-        if os.path.exists(DQ_METRICS_PATH):
-            dq_df = read_delta_pandas(DQ_METRICS_PATH)
-            if not dq_df.empty:
-                row = dq_df.sort_values("validation_time", ascending=False).iloc[0]
-                total_val = int(row["total_rows"])
-                null_ids = int(row.get("null_ids", 0))
-                invalid_ages = int(row.get("invalid_ages", 0))
-                duplicate_ids = int(row.get("duplicate_ids", 0))
-                
-                failed = null_ids + invalid_ages + duplicate_ids
-                passed = max(0, total_val - failed)
-                dq_score = (passed / total_val * 100) if total_val > 0 else 100.0
-                
-                report_data["dq_score"] = f"{dq_score:.1f}%"
-                report_data["null_ids"] = null_ids
-                report_data["invalid_ages"] = invalid_ages
-                report_data["duplicate_ids"] = duplicate_ids
-    except Exception as e:
-        print(f"Error fetching DQ metrics for report: {e}")
+    # Resolve dataset type
+    if not dataset_type:
+        dataset_type = last_record.get("dataset_type") or get_latest_dataset_type()
+    report_data["dataset_type"] = dataset_type
+    
+    dq_report = get_dq_run_report(spark, run_id=report_data["run_id"])
+    if dq_report:
+        report_data["dq_report"] = dq_report
+        report_data["dq_score"] = f"{dq_report.get('dq_score', 100.0):.1f}%"
+        report_data["null_ids"] = int(dq_report.get("null_ids", 0))
+        report_data["invalid_ages"] = int(dq_report.get("invalid_ages", 0))
+        report_data["duplicate_ids"] = int(dq_report.get("duplicate_ids", 0))
+    else:
+        try:
+            if os.path.exists(DQ_METRICS_PATH):
+                dq_df = read_delta_pandas(DQ_METRICS_PATH)
+                if not dq_df.empty:
+                    row = dq_df.sort_values("validation_time", ascending=False).iloc[0]
+                    total_val = int(row["total_rows"])
+                    null_ids = int(row.get("null_ids", 0))
+                    invalid_ages = int(row.get("invalid_ages", 0))
+                    duplicate_ids = int(row.get("duplicate_ids", 0))
+                    
+                    failed = null_ids + invalid_ages + duplicate_ids
+                    passed = max(0, total_val - failed)
+                    dq_score = (passed / total_val * 100) if total_val > 0 else 100.0
+                    
+                    report_data["dq_score"] = f"{dq_score:.1f}%"
+                    report_data["null_ids"] = null_ids
+                    report_data["invalid_ages"] = invalid_ages
+                    report_data["duplicate_ids"] = duplicate_ids
+        except Exception as e:
+            print(f"Error fetching DQ metrics for report: {e}")
         
     if gold_df is not None:
         report_data["gold_summary"] = gold_df
@@ -780,6 +948,8 @@ def generate_txt_report(data):
     if not data:
         return "No report data available."
         
+    dataset_type = data.get("dataset_type", "GENERIC")
+    
     report = []
     report.append("==================================================")
     report.append("          GOLD ANALYTICS QUALITY REPORT           ")
@@ -788,6 +958,7 @@ def generate_txt_report(data):
     report.append(f"Run ID          : {data.get('run_id')}")
     report.append(f"Timestamp       : {data.get('timestamp')}")
     report.append(f"Runtime         : {data.get('runtime')}")
+    report.append(f"Dataset Mode    : {dataset_type}")
     report.append("--------------------------------------------------")
     report.append(" DATA PROCESSING STATS:                           ")
     report.append(f" - Rows Received : {data.get('rows_received'):,}")
@@ -796,21 +967,55 @@ def generate_txt_report(data):
     report.append("--------------------------------------------------")
     report.append(" DATA QUALITY SCORE:                              ")
     report.append(f" - DQ Score      : {data.get('dq_score')}")
-    report.append(f" - Null IDs      : {data.get('null_ids'):,}")
-    report.append(f" - Duplicate IDs : {data.get('duplicate_ids'):,}")
-    report.append(f" - Invalid Ages  : {data.get('invalid_ages'):,}")
+    
+    dq_report = data.get("dq_report") or {}
+    
+    if dataset_type == "CUSTOMER":
+        report.append(f" - Null IDs      : {data.get('null_ids', 0):,}")
+        report.append(f" - Duplicate IDs : {data.get('duplicate_ids', 0):,}")
+        report.append(f" - Invalid Ages  : {data.get('invalid_ages', 0):,}")
+    elif dataset_type == "ORDERS":
+        report.append(f" - Null Order IDs: {int(dq_report.get('null_order_ids', 0)):,}")
+        report.append(f" - Duplicate IDs : {int(dq_report.get('duplicate_ids', 0)):,}")
+        report.append(f" - Invalid Qty   : {int(dq_report.get('invalid_qty', 0)):,}")
+        report.append(f" - Invalid Price : {int(dq_report.get('invalid_price', 0)):,}")
+    else:
+        report.append(f" - Completeness  : {float(dq_report.get('completeness_score', 100.0)):.2f}%")
+        report.append(f" - Duplicate Rate: {float(dq_report.get('duplicate_rate', 0.0)):.2f}%")
+        report.append(f" - Total Columns : {int(dq_report.get('total_columns', 0)):,}")
+        
     report.append("--------------------------------------------------")
     report.append(" GOLD LAYER METRICS SUMMARY:                      ")
     
     gold_df = data.get("gold_summary")
     if gold_df is not None and not gold_df.empty:
-        report.append(f"{'Processed Date':<18} | {'Average Age':<12} | {'Total Users':<12}")
-        report.append("-" * 50)
-        for _, row in gold_df.iterrows():
-            p_date = str(row.get("processed_date", "N/A"))
-            avg_age = f"{float(row.get('average_age', 0.0)):.2f}"
-            t_users = f"{int(row.get('total_users', 0)):,}"
-            report.append(f"{p_date:<18} | {avg_age:<12} | {t_users:<12}")
+        if dataset_type == "CUSTOMER":
+            report.append(f"{'Processed Date':<18} | {'Average Age':<12} | {'Total Users':<12}")
+            report.append("-" * 50)
+            for _, row in gold_df.iterrows():
+                p_date = str(row.get("processed_date", "N/A"))
+                avg_age = f"{float(row.get('average_age', 0.0)):.2f}"
+                t_users = f"{int(row.get('total_users', 0)):,}"
+                report.append(f"{p_date:<18} | {avg_age:<12} | {t_users:<12}")
+        elif dataset_type == "ORDERS":
+            report.append(f"{'Processed Date':<18} | {'Total Orders':<12} | {'Total Revenue':<15} | {'Avg Order Val':<12}")
+            report.append("-" * 65)
+            for _, row in gold_df.iterrows():
+                p_date = str(row.get("processed_date", "N/A"))
+                tot_ord = f"{int(row.get('total_orders', 0)):,}"
+                tot_rev = f"${float(row.get('total_revenue', 0.0)):,.2f}"
+                avg_val = f"${float(row.get('avg_order_value', 0.0)):,.2f}"
+                report.append(f"{p_date:<18} | {tot_ord:<12} | {tot_rev:<15} | {avg_val:<12}")
+        else:
+            report.append(f"{'Processed Date':<18} | {'Total Rows':<12} | {'Total Cols':<12} | {'Completeness':<12} | {'Dup Rate':<10}")
+            report.append("-" * 75)
+            for _, row in gold_df.iterrows():
+                p_date = str(row.get("processed_date", "N/A"))
+                tot_rows = f"{int(row.get('total_rows', 0)):,}"
+                tot_cols = f"{int(row.get('total_columns', 0)):,}"
+                comp = f"{float(row.get('completeness_score', 100.0)):.2f}%"
+                dups = f"{float(row.get('duplicate_rate', 0.0)):.2f}%"
+                report.append(f"{p_date:<18} | {tot_rows:<12} | {tot_cols:<12} | {comp:<12} | {dups:<10}")
     else:
         report.append(" - No Gold layer metrics aggregated yet.")
     report.append("==================================================")
@@ -828,6 +1033,9 @@ def generate_pdf_report(data):
         from fpdf import FPDF
     except ImportError:
         return b""
+        
+    dataset_type = data.get("dataset_type", "GENERIC")
+    dq_report = data.get("dq_report") or {}
         
     class PDF(FPDF):
         def header(self):
@@ -857,6 +1065,8 @@ def generate_pdf_report(data):
     pdf.cell(0, 6, str(data.get("timestamp")), new_x="LMARGIN", new_y="NEXT")
     pdf.cell(50, 6, "Run Duration:", new_x="RIGHT")
     pdf.cell(0, 6, str(data.get("runtime")), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(50, 6, "Dataset Mode:", new_x="RIGHT")
+    pdf.cell(0, 6, dataset_type, new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
     
     pdf.set_font("Helvetica", "B", 12)
@@ -875,12 +1085,30 @@ def generate_pdf_report(data):
     pdf.set_font("Helvetica", size=10)
     pdf.cell(50, 6, "Data Quality Score:", new_x="RIGHT")
     pdf.cell(0, 6, str(data.get("dq_score")), new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(50, 6, "Null ID Violations:", new_x="RIGHT")
-    pdf.cell(0, 6, f"{data.get('null_ids'):,}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(50, 6, "Duplicate ID Violations:", new_x="RIGHT")
-    pdf.cell(0, 6, f"{data.get('duplicate_ids'):,}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(50, 6, "Invalid Age Violations:", new_x="RIGHT")
-    pdf.cell(0, 6, f"{data.get('invalid_ages'):,}", new_x="LMARGIN", new_y="NEXT")
+    
+    if dataset_type == "CUSTOMER":
+        pdf.cell(50, 6, "Null ID Violations:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{data.get('null_ids'):,}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(50, 6, "Duplicate ID Violations:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{data.get('duplicate_ids'):,}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(50, 6, "Invalid Age Violations:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{data.get('invalid_ages'):,}", new_x="LMARGIN", new_y="NEXT")
+    elif dataset_type == "ORDERS":
+        pdf.cell(50, 6, "Null Order ID Violations:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{int(dq_report.get('null_order_ids', 0)):,}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(50, 6, "Duplicate Order ID Violations:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{int(dq_report.get('duplicate_ids', 0)):,}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(50, 6, "Invalid Qty Violations:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{int(dq_report.get('invalid_qty', 0)):,}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(50, 6, "Invalid Price Violations:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{int(dq_report.get('invalid_price', 0)):,}", new_x="LMARGIN", new_y="NEXT")
+    else:
+        pdf.cell(50, 6, "Data Completeness:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{float(dq_report.get('completeness_score', 100.0)):.2f}%", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(50, 6, "Duplicate Row Percentage:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{float(dq_report.get('duplicate_rate', 0.0)):.2f}%", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(50, 6, "Total Ingested Columns:", new_x="RIGHT")
+        pdf.cell(0, 6, f"{int(dq_report.get('total_columns', 0)):,}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(5)
     
     pdf.set_font("Helvetica", "B", 12)
@@ -889,20 +1117,60 @@ def generate_pdf_report(data):
     
     gold_df = data.get("gold_summary")
     if gold_df is not None and not gold_df.empty:
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(60, 8, "Processed Date", border=1, align="C", new_x="RIGHT")
-        pdf.cell(60, 8, "Average Age", border=1, align="C", new_x="RIGHT")
-        pdf.cell(60, 8, "Total Users", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
-        
-        pdf.set_font("Helvetica", size=10)
-        for _, row in gold_df.iterrows():
-            p_date = str(row.get("processed_date", "N/A"))
-            avg_age = f"{float(row.get('average_age', 0.0)):.2f}"
-            t_users = f"{int(row.get('total_users', 0)):,}"
+        if dataset_type == "CUSTOMER":
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(60, 8, "Processed Date", border=1, align="C", new_x="RIGHT")
+            pdf.cell(60, 8, "Average Age", border=1, align="C", new_x="RIGHT")
+            pdf.cell(60, 8, "Total Users", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
             
-            pdf.cell(60, 7, p_date, border=1, align="C", new_x="RIGHT")
-            pdf.cell(60, 7, avg_age, border=1, align="C", new_x="RIGHT")
-            pdf.cell(60, 7, t_users, border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", size=10)
+            for _, row in gold_df.iterrows():
+                p_date = str(row.get("processed_date", "N/A"))
+                avg_age = f"{float(row.get('average_age', 0.0)):.2f}"
+                t_users = f"{int(row.get('total_users', 0)):,}"
+                
+                pdf.cell(60, 7, p_date, border=1, align="C", new_x="RIGHT")
+                pdf.cell(60, 7, avg_age, border=1, align="C", new_x="RIGHT")
+                pdf.cell(60, 7, t_users, border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+        elif dataset_type == "ORDERS":
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(45, 8, "Processed Date", border=1, align="C", new_x="RIGHT")
+            pdf.cell(40, 8, "Total Orders", border=1, align="C", new_x="RIGHT")
+            pdf.cell(50, 8, "Total Revenue", border=1, align="C", new_x="RIGHT")
+            pdf.cell(45, 8, "Avg Order Val", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+            
+            pdf.set_font("Helvetica", size=10)
+            for _, row in gold_df.iterrows():
+                p_date = str(row.get("processed_date", "N/A"))
+                tot_ord = f"{int(row.get('total_orders', 0)):,}"
+                tot_rev = f"${float(row.get('total_revenue', 0.0)):,.2f}"
+                avg_val = f"${float(row.get('avg_order_value', 0.0)):,.2f}"
+                
+                pdf.cell(45, 7, p_date, border=1, align="C", new_x="RIGHT")
+                pdf.cell(40, 7, tot_ord, border=1, align="C", new_x="RIGHT")
+                pdf.cell(50, 7, tot_rev, border=1, align="C", new_x="RIGHT")
+                pdf.cell(45, 7, avg_val, border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+        else:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(40, 8, "Processed Date", border=1, align="C", new_x="RIGHT")
+            pdf.cell(35, 8, "Total Rows", border=1, align="C", new_x="RIGHT")
+            pdf.cell(35, 8, "Total Cols", border=1, align="C", new_x="RIGHT")
+            pdf.cell(40, 8, "Completeness", border=1, align="C", new_x="RIGHT")
+            pdf.cell(30, 8, "Dup Rate", border=1, align="C", new_x="LMARGIN", new_y="NEXT")
+            
+            pdf.set_font("Helvetica", size=10)
+            for _, row in gold_df.iterrows():
+                p_date = str(row.get("processed_date", "N/A"))
+                tot_rows = f"{int(row.get('total_rows', 0)):,}"
+                tot_cols = f"{int(row.get('total_columns', 0)):,}"
+                comp = f"{float(row.get('completeness_score', 100.0)):.2f}%"
+                dups = f"{float(row.get('duplicate_rate', 0.0)):.2f}%"
+                
+                pdf.cell(40, 7, p_date, border=1, align="C", new_x="RIGHT")
+                pdf.cell(35, 7, tot_rows, border=1, align="C", new_x="RIGHT")
+                pdf.cell(35, 7, tot_cols, border=1, align="C", new_x="RIGHT")
+                pdf.cell(40, 7, comp, border=1, align="C", new_x="RIGHT")
+                pdf.cell(30, 7, dups, border=1, align="C", new_x="LMARGIN", new_y="NEXT")
     else:
         pdf.set_font("Helvetica", "I", 10)
         pdf.cell(0, 6, "No Gold metrics summary aggregated.", new_x="LMARGIN", new_y="NEXT")
