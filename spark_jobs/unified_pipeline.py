@@ -547,10 +547,27 @@ def run_unified_pipeline():
     except Exception as e:
         duration = time.time() - script_start_time
         error_msg = str(e)
+        
+        # Log the full stack trace for developer troubleshooting
+        import traceback
+        print("\n=== TECHNICAL DETAIL STACK TRACE ===")
+        traceback.print_exc()
+        print("====================================\n")
+        
         print(f"\n[Pipeline] FAILED after {duration:.1f}s: {error_msg}")
-        write_status("failed", run_id, error=error_msg, stage="Failed", duration=duration)
+        
+        # Determine business-friendly error message
+        friendly_error = error_msg
+        if "SchemaValidationError" in type(e).__name__ or "Unsupported dataset schema" in error_msg:
+            friendly_error = error_msg
+        elif "AnalysisException" in error_msg or "UNRESOLVED_COLUMN" in error_msg:
+            friendly_error = "Database Error: A column resolution or query analysis failure occurred in Spark."
+        elif "NoCredentialsError" in error_msg:
+            friendly_error = "AWS S3 Authentication Error: Failed to locate credentials to write S3 exports."
+            
+        write_status("failed", run_id, error=friendly_error, stage="Failed", duration=duration)
         append_to_history("failed", run_id, file_name=source_file,
-                          error=error_msg, duration=duration, rows=0)
+                          error=friendly_error, duration=duration, rows=0)
 
         # Sync partial results and logs back to original storage on failure
         if use_fast_io:

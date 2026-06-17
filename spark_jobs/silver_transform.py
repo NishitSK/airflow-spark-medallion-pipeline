@@ -56,30 +56,36 @@ def transform_silver(spark=None, valid_df: DataFrame = None, row_count: int = No
         cleaning = config.get("cleaning", {})
         age_cfg  = config.get("columns", {}).get("age", {})
 
+        # Build transformed DataFrame dynamically based on present columns
+        transformed_df = bronze_df
+        
         # ---- Normalize ID ----
-        cleaned_id  = regexp_replace(trim(col("id")),  r"\.0+$", "").cast("int")
-
+        if "id" in bronze_df.columns:
+            cleaned_id  = regexp_replace(trim(col("id")),  r"\.0+$", "").cast("int")
+            transformed_df = transformed_df.withColumn("id", cleaned_id)
+            
         # ---- Normalize Age ----
-        cleaned_age = regexp_replace(trim(col("age")), r"\.0+$", "").cast("int")
-        null_impute = age_cfg.get("null_impute_value", 45)
-        final_age   = when(cleaned_age.isNull(), lit(null_impute)).otherwise(cleaned_age)
-
+        if "age" in bronze_df.columns:
+            cleaned_age = regexp_replace(trim(col("age")), r"\.0+$", "").cast("int")
+            null_impute = age_cfg.get("null_impute_value", 45)
+            final_age   = when(cleaned_age.isNull(), lit(null_impute)).otherwise(cleaned_age)
+            transformed_df = transformed_df.withColumn("age", final_age)
+            
         # ---- Normalize Name ----
-        name_col = trim(col("name"))
-        if cleaning.get("name", {}).get("title_case", True):
-            name_col = initcap(name_col)
+        if "name" in bronze_df.columns:
+            name_col = trim(col("name"))
+            if cleaning.get("name", {}).get("title_case", True):
+                name_col = initcap(name_col)
+            transformed_df = transformed_df.withColumn("name", name_col)
 
-        # Build transformed DataFrame
-        transformed_df = bronze_df \
-            .withColumn("id",   cleaned_id) \
-            .withColumn("age",  final_age) \
-            .withColumn("name", name_col)
-
-        # Deduplicate on ID (safety net for any edge cases the DQ engine may miss)
+        # Deduplicate on ID if ID exists (safety net for any edge cases the DQ engine may miss)
         if valid_df is not None:
             final_df = transformed_df
         else:
-            final_df = transformed_df.dropDuplicates(["id"])
+            if "id" in transformed_df.columns:
+                final_df = transformed_df.dropDuplicates(["id"])
+            else:
+                final_df = transformed_df
 
         # Add processed_date partition column
         final_df = final_df.withColumn("processed_date", to_date("ingestion_time"))

@@ -91,6 +91,10 @@ def ingest_bronze(spark=None, run_id="unknown", bg_threads=None):
             print(f"[Bronze] Warning: Schema mapping failed: {schema_err}")
         print(f"[Bronze Timing] Schema mapping took: {time.time() - map_t0:.2f} seconds")
 
+        # Validate schema after mapping aliases
+        from pipeline.schema_validator import validate_schema
+        validate_schema(df, source_file=source_file)
+
         write_t0 = time.time()
         import threading
         def write_bronze_bg():

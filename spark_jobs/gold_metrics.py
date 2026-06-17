@@ -40,10 +40,11 @@ def generate_gold(spark=None, scorecard: dict = None, anomalies: list = None,
             df_to_use = read_delta(spark, SILVER_PATH)
 
         # -- Business aggregations (only clean records) --
-        business_df = df_to_use.groupBy("processed_date").agg(
-            avg("age").alias("average_age"),
-            count("*").alias("total_users")
-        )
+        agg_ops = [count("*").alias("total_users")]
+        if "age" in df_to_use.columns:
+            agg_ops.append(avg("age").alias("average_age"))
+            
+        business_df = df_to_use.groupBy("processed_date").agg(*agg_ops)
 
         write_delta(business_df, GOLD_PATH, mode="overwrite", partition_by="processed_date")
 
